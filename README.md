@@ -6,6 +6,7 @@
 
 ### The open-source AI terminal hub — intelligent multi-model routing, portable skills, agents, and remote access. Local-first. Hackable. Terminal-native.
 
+[![CI](https://github.com/Manjussha/skillos/actions/workflows/ci.yml/badge.svg)](https://github.com/Manjussha/skillos/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.7-3178C6?logo=typescript&logoColor=white)](https://www.typescriptlang.org/)
 [![Node.js](https://img.shields.io/badge/Node.js-%E2%89%A520-339933?logo=node.js&logoColor=white)](https://nodejs.org/)
@@ -39,6 +40,13 @@ You → Terminal → Command Parser → Skill Engine → Model Router → Provid
 > ⚙️ **Status: v0.1, feature-complete and runnable.** Works **fully offline** out of the box via a built-in mock provider (no API key required to try it). Add an OpenRouter key or run Ollama for real model output.
 
 ---
+
+## 🎬 Demo
+
+<div align="center">
+<img src="assets/brand/demo.svg" alt="SkillOS terminal demo — listing skills and running a Planner → Coder → Reviewer workflow" width="760">
+<br><sub>A SkillOS session: list skills, then run a multi-agent <code>/build-dashboard</code> workflow.</sub>
+</div>
 
 ## ✨ Features
 
