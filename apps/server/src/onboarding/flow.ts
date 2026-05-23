@@ -26,7 +26,7 @@ export interface OnboardingState {
   userType: string;
   stacks: string[];
   mode: string;
-  /** Chosen AI provider: "openrouter" | "ollama" | "skip". */
+  /** Chosen AI provider id (registry id, or "ollama"/"skip"). */
   provider: string;
   /** API key captured for a key-based provider (persisted to .env, not the DB). */
   apiKey: string;
@@ -58,11 +58,32 @@ export const MODES: { key: string; label: string; value: string }[] = [
   { key: "4", label: "Local / private AI", value: "local" },
 ];
 
-export const PROVIDERS: { key: string; label: string; value: string }[] = [
-  { key: "1", label: "OpenRouter — paste an API key (many models, one key)", value: "openrouter" },
-  { key: "2", label: "Ollama — local models, no key (must be running)", value: "ollama" },
-  { key: "3", label: "Skip for now — demo with built-in mock responses", value: "skip" },
+/**
+ * Providers offered during onboarding. OpenRouter stays first (one key, many
+ * models). The direct key-based providers all route to the same apiKey step;
+ * `needsKey` decides whether the flow asks for one. Keep this in sync with the
+ * registry in providers/provider.ts.
+ */
+export const PROVIDERS: {
+  key: string;
+  label: string;
+  value: string;
+  needsKey: boolean;
+}[] = [
+  { key: "1", label: "OpenRouter — one key, many models", value: "openrouter", needsKey: true },
+  { key: "2", label: "OpenAI — GPT-4o", value: "openai", needsKey: true },
+  { key: "3", label: "Anthropic — Claude", value: "anthropic", needsKey: true },
+  { key: "4", label: "Google — Gemini", value: "google", needsKey: true },
+  { key: "5", label: "Groq — fast Llama", value: "groq", needsKey: true },
+  { key: "6", label: "DeepSeek", value: "deepseek", needsKey: true },
+  { key: "7", label: "Ollama — local models, no key (must be running)", value: "ollama", needsKey: false },
+  { key: "8", label: "Skip for now — demo with built-in mock responses", value: "skip", needsKey: false },
 ];
+
+/** Human label for a provider value (for the apiKey prompt). */
+function providerLabel(value: string): string {
+  return PROVIDERS.find((p) => p.value === value)?.label.split(" — ")[0] ?? value;
+}
 
 export function newOnboarding(): OnboardingState {
   return {
@@ -77,7 +98,7 @@ export function newOnboarding(): OnboardingState {
 }
 
 /** The prompt text to show for the current step. */
-export function promptFor(step: OnboardingStep): string {
+export function promptFor(step: OnboardingStep, provider = "openrouter"): string {
   switch (step) {
     case "useCase":
       return [
@@ -104,7 +125,7 @@ export function promptFor(step: OnboardingStep): string {
       ].join("\n");
     case "apiKey":
       return [
-        "5) Paste your OpenRouter API key, or type 'skip' to decide later.",
+        `5) Paste your ${providerLabel(provider)} API key, or type 'skip' to decide later.`,
         "   (Stored locally in .env, which is gitignored. Heads-up: what you",
         "    type is visible in the terminal.)",
       ].join("\n");
@@ -166,9 +187,10 @@ export function applyAnswer(
     case "provider": {
       const byKey = PROVIDERS.find((p) => p.key === text);
       const byVal = PROVIDERS.find((p) => p.value === text.toLowerCase());
-      const provider = (byKey ?? byVal)?.value ?? "skip";
-      // Only OpenRouter needs a key; others finish the flow here.
-      const next = provider === "openrouter" ? "apiKey" : "done";
+      const picked = byKey ?? byVal;
+      const provider = picked?.value ?? "skip";
+      // Key-based providers advance to the apiKey step; keyless ones finish.
+      const next = picked?.needsKey ? "apiKey" : "done";
       return { ...state, provider, step: next };
     }
     case "apiKey": {

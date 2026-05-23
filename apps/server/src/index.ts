@@ -5,10 +5,13 @@ import { createServer, type IncomingMessage } from "node:http";
 import { WebSocketServer, WebSocket } from "ws";
 import { parse } from "./parser.js";
 import { loadSkills, skillsDir } from "./skills/engine.js";
-import { routeModel, KNOWN_MODELS } from "./router/router.js";
+import { routeModel } from "./router/router.js";
 import {
   resolveProvider,
   streamCompletion,
+  providerInfo,
+  modelsFor,
+  activeProvider,
   type RouteMode,
 } from "./providers/provider.js";
 import type { ClientMessage, ServerMessage, Skill } from "./types.js";
@@ -560,7 +563,10 @@ async function advanceOnboarding(
   session.onboarding = applyAnswer(session.onboarding, answer);
 
   if (session.onboarding.step !== "done") {
-    send(ws, { type: "info", text: promptFor(session.onboarding.step) });
+    send(ws, {
+      type: "info",
+      text: promptFor(session.onboarding.step, session.onboarding.provider),
+    });
     return;
   }
 
@@ -666,17 +672,17 @@ async function doGenerateSkills(ws: WebSocket, description: string): Promise<voi
 // Runtime LLM picker (Feature A) — /provider and /models, OpenCode-style
 // ---------------------------------------------------------------------------
 
-/** Derive the currently-active backend from the live environment. */
+/** Human-readable label for the currently-active backend (id + key/endpoint). */
 function activeBackend(): string {
-  if (process.env.OPENROUTER_API_KEY) return "openrouter";
-  if (process.env.OLLAMA_BASE_URL) return "ollama";
-  return "mock (offline)";
+  const id = activeProvider();
+  return id === "mock" ? "mock (offline)" : id;
 }
 
 /**
  * `/provider` — switch provider / connect an API key at runtime. Local-only,
- * like onboarding, because it writes `.env`. Shows a numbered list, sets the
- * picker, and ends the turn; the selection is handled on the next input.
+ * like onboarding, because it writes `.env`. Lists ALL providers via
+ * providerInfo() with active (*) and keyed (✓) markers, sets the picker, and
+ * ends the turn; the selection is handled on the next input.
  */
 function startProviderPicker(ws: WebSocket, session: Session): void {
   if (!session.isLocal) {
@@ -687,33 +693,40 @@ function startProviderPicker(ws: WebSocket, session: Session): void {
     return;
   }
   session.picker = { kind: "provider" };
+  const lines = providerInfo().map((p, i) => {
+    const active = p.active ? " *" : "";
+    const keyed = p.hasKey ? " ✓" : "";
+    const need = p.needsKey && !p.hasKey ? " (needs key)" : "";
+    return `  ${i + 1}) ${p.label}${need}${keyed}${active}`;
+  });
   send(ws, {
     type: "info",
     text: [
-      `Active backend: ${activeBackend()}.`,
-      "Choose a provider (or type a /command to cancel):",
-      "  1) OpenRouter (paste key — unlocks Claude/GPT/Gemini/DeepSeek/Groq)",
-      "  2) Ollama (local, no key)",
-      "  3) Skip (offline mock)",
+      `Active provider: ${activeBackend()}.  (* = active, ✓ = key set)`,
+      "Choose a provider by number (or type a /command to cancel):",
+      ...lines,
     ].join("\n"),
   });
 }
 
 /**
- * `/models` — pick the active logical model at runtime. Lists KNOWN_MODELS with
- * the current override marked, sets the picker, and ends the turn.
+ * `/models` — pick a concrete model for the ACTIVE provider at runtime. Lists
+ * modelsFor(active) with the current override marked, sets the picker, and ends
+ * the turn.
  */
 function startModelPicker(ws: WebSocket, session: Session): void {
   session.picker = { kind: "model" };
+  const active = activeProvider();
+  const models = modelsFor(active);
   const current = session.override ?? "auto";
-  const lines = KNOWN_MODELS.map((m, i) => {
+  const lines = models.map((m, i) => {
     const mark = m === session.override ? " *" : "";
     return `  ${i + 1}) ${m}${mark}`;
   });
   send(ws, {
     type: "info",
     text: [
-      `Current model: ${current} (* = active override).`,
+      `Active provider: ${active}. Current model: ${current} (* = active override).`,
       "Pick a model by number (or 0 / 'auto' to clear; /command to cancel):",
       ...lines,
     ].join("\n"),
@@ -736,34 +749,38 @@ async function advancePicker(
 
   if (picker.kind === "provider") {
     const choice = text.toLowerCase();
-    if (choice === "1" || choice === "openrouter") {
-      // Advance to the API-key step rather than finishing.
-      session.picker = { kind: "apiKey", provider: "openrouter" };
+    const list = providerInfo();
+    const n = Number(choice);
+    const byNum =
+      Number.isInteger(n) && n >= 1 && n <= list.length ? list[n - 1] : undefined;
+    const byId = list.find((p) => p.id === choice || p.id === choice.replace(/\s+/g, ""));
+    const picked = byNum ?? byId;
+    if (!picked) {
+      // Unrecognized — cancel cleanly so the user isn't stuck.
+      session.picker = null;
       send(ws, {
         type: "info",
-        text:
-          "Paste your OpenRouter API key (stored in .env, gitignored), or type " +
-          "'skip' to cancel. Heads-up: what you type is visible in the terminal.",
+        text: `"${text}" isn't a provider option — picker cancelled.`,
       });
       return endTurn(ws);
     }
-    if (choice === "2" || choice === "ollama") {
-      const env = await applyProviderChoice("ollama", "");
-      session.picker = null;
-      send(ws, { type: "info", text: `${env.message}\nActive backend: ${activeBackend()}.` });
+    // A key-based provider without a key yet → advance to the apiKey step.
+    if (picked.needsKey && !picked.hasKey) {
+      session.picker = { kind: "apiKey", provider: picked.id };
+      send(ws, {
+        type: "info",
+        text:
+          `Paste your ${picked.label} API key (stored in .env, gitignored), or ` +
+          `type 'skip' to cancel. Heads-up: what you type is visible in the terminal.`,
+      });
       return endTurn(ws);
     }
-    if (choice === "3" || choice === "skip") {
-      const env = await applyProviderChoice("skip", "");
-      session.picker = null;
-      send(ws, { type: "info", text: `${env.message}\nActive backend: ${activeBackend()}.` });
-      return endTurn(ws);
-    }
-    // Unrecognized — cancel cleanly so the user isn't stuck.
+    // Keyless, or already keyed → switch active provider immediately.
+    const env = await applyProviderChoice(picked.id, "");
     session.picker = null;
     send(ws, {
       type: "info",
-      text: `"${text}" isn't a provider option — picker cancelled.`,
+      text: `${env.message}\nActive provider: ${activeBackend()}.`,
     });
     return endTurn(ws);
   }
@@ -776,11 +793,15 @@ async function advancePicker(
     }
     const env = await applyProviderChoice(picker.provider, text);
     session.picker = null;
-    send(ws, { type: "info", text: `${env.message}\nActive backend: ${activeBackend()}.` });
+    send(ws, {
+      type: "info",
+      text: `${env.message}\nActive provider: ${activeBackend()}.`,
+    });
     return endTurn(ws);
   }
 
-  // Model picker.
+  // Model picker — choose a concrete model of the active provider.
+  const models = modelsFor(activeProvider());
   const choice = text.toLowerCase();
   if (choice === "0" || choice === "auto") {
     session.override = null;
@@ -789,15 +810,15 @@ async function advancePicker(
     return endTurn(ws);
   }
   const n = Number(choice);
-  if (Number.isInteger(n) && n >= 1 && n <= KNOWN_MODELS.length) {
-    const model = KNOWN_MODELS[n - 1]!;
+  if (Number.isInteger(n) && n >= 1 && n <= models.length) {
+    const model = models[n - 1]!;
     session.override = model;
     session.picker = null;
     send(ws, { type: "info", text: `Model override set to "${model}".` });
     return endTurn(ws);
   }
-  // Allow selecting by exact name too.
-  const byName = (KNOWN_MODELS as readonly string[]).find((m) => m === choice);
+  // Allow selecting by exact (case-sensitive) model id too.
+  const byName = models.find((m) => m === text);
   if (byName) {
     session.override = byName;
     session.picker = null;

@@ -94,7 +94,7 @@ Then try:
 /remote start                          # public URL + QR (degrades gracefully)
 ```
 
-**Want real models?** Choose **OpenRouter** during onboarding and paste a key (saved to `.env`, applied instantly — no restart), or run [Ollama](https://ollama.com) locally for private, on-device AI.
+**Want real models?** Pick a provider during onboarding — **OpenRouter** (one key, many models) or a direct provider (**OpenAI / Anthropic / Google / Groq / DeepSeek**) — and paste its key (saved to `.env`, applied instantly — no restart), or run [Ollama](https://ollama.com) locally for private, on-device AI. Switch providers any time at runtime with **`/provider`** (lists all providers, marks the active one and which already have a key) and pick a specific model with **`/models`**. The active provider is remembered via `SKILLOS_PROVIDER`.
 
 ---
 
