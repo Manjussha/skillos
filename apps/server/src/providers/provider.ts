@@ -4,6 +4,13 @@ import { createGoogleGenerativeAI } from "@ai-sdk/google";
 import { createGroq } from "@ai-sdk/groq";
 import { createDeepSeek } from "@ai-sdk/deepseek";
 import { streamText, type LanguageModel } from "ai";
+import {
+  CLI_PROVIDER_BRIDGES,
+  isCliProviderId,
+  isCliInstalled,
+  runCliAsk,
+  type CliProviderId,
+} from "../bridges/registry.js";
 
 /**
  * Provider layer. Maps a logical model name (from the router) to a concrete
@@ -15,9 +22,14 @@ import { streamText, type LanguageModel } from "ai";
  * the registry below: its env key, selectable models, and a logical→model map.
  *
  * Direct providers (openai/anthropic/google/groq/deepseek) and OpenRouter all
- * go through the Vercel AI SDK (`streamText`). Ollama uses its native streaming
- * API via `fetch` (no SDK). A built-in "mock" provider runs when nothing is
- * configured, so the full loop is demoable offline.
+ * go through the Vercel AI SDK (`streamText`). Ollama (local) uses its native
+ * streaming API via `fetch` (no SDK); Ollama Cloud uses the OpenAI-compatible
+ * SDK against ollama.com. Installed AI CLIs (Claude Code, Gemini, OpenCode, Kilo
+ * Code) are also selectable as the ACTIVE provider — selecting one routes the
+ * whole core loop through that CLI using ITS own auth (no SkillOS key); these
+ * resolve to the `cli` kind and stream via the corresponding bridge. A built-in
+ * "mock" provider runs when nothing is configured, so the loop is demoable
+ * offline.
  */
 
 export type ProviderKind =
@@ -28,7 +40,12 @@ export type ProviderKind =
   | "deepseek"
   | "openrouter"
   | "ollama"
-  | "mock";
+  | "ollama-cloud"
+  | "mock"
+  // Resolution-only kind: an installed AI CLI acting as the active provider.
+  // It is NOT a PROVIDER_REGISTRY entry — the concrete CLI id is carried on the
+  // Resolution (`cli`) and the picker offers CLIs from CLI_PROVIDER_BRIDGES.
+  | "cli";
 
 /**
  * The user's preferred routing mode (from onboarding). It biases provider/model
@@ -38,12 +55,20 @@ export type ProviderKind =
  */
 export type RouteMode = "fast" | "best" | "cheapest" | "local";
 
+/**
+ * Registry-backed provider kinds (everything EXCEPT `cli`, which is a
+ * resolution-only kind carried on the Resolution rather than the registry).
+ */
+export type RegistryKind = Exclude<ProviderKind, "cli">;
+
 export interface Resolution {
   kind: ProviderKind;
-  /** Provider-specific model id. */
+  /** Provider-specific model id. For `cli`, this is the CLI id (e.g. "gemini"). */
   model: string;
   /** Human-readable label for `done` metadata, e.g. "anthropic:claude-3-5-sonnet-latest". */
   provider: string;
+  /** Set when `kind === "cli"`: which installed CLI bridge answers the turn. */
+  cliId?: CliProviderId;
 }
 
 /** Logical names the router emits; every provider maps these to a real model. */
@@ -51,7 +76,7 @@ type Logical = "claude" | "gpt" | "gemini" | "deepseek-coder" | "default";
 
 /** Static description of a provider in the registry. */
 export interface ProviderDef {
-  id: ProviderKind;
+  id: RegistryKind;
   label: string;
   /** Env var holding the API key; null for keyless providers (ollama/mock). */
   envKey: string | null;
@@ -69,7 +94,7 @@ export interface ProviderDef {
 // Registry — add a provider by adding an entry here (+ a factory in the switch).
 // ---------------------------------------------------------------------------
 
-export const PROVIDER_REGISTRY: Record<ProviderKind, ProviderDef> = {
+export const PROVIDER_REGISTRY: Record<RegistryKind, ProviderDef> = {
   openai: {
     id: "openai",
     label: "OpenAI",
@@ -184,6 +209,22 @@ export const PROVIDER_REGISTRY: Record<ProviderKind, ProviderDef> = {
     },
     defaultModel: "llama3.1",
   },
+  "ollama-cloud": {
+    id: "ollama-cloud",
+    label: "Ollama Cloud (hosted, key)",
+    envKey: "OLLAMA_API_KEY",
+    needsKey: true,
+    // Hosted Ollama exposes large open models behind an OpenAI-compatible API.
+    models: ["gpt-oss:120b", "gpt-oss:20b"],
+    logical: {
+      claude: "gpt-oss:120b",
+      gpt: "gpt-oss:120b",
+      gemini: "gpt-oss:120b",
+      "deepseek-coder": "gpt-oss:20b",
+      default: "gpt-oss:20b",
+    },
+    defaultModel: "gpt-oss:20b",
+  },
   mock: {
     id: "mock",
     label: "Mock (offline)",
@@ -206,13 +247,14 @@ export const PROVIDER_REGISTRY: Record<ProviderKind, ProviderDef> = {
  * the first provider in this order whose key is present. OpenRouter stays ahead
  * of the direct providers to preserve today's behavior (one key, many models).
  */
-const AUTO_PRIORITY: ProviderKind[] = [
+const AUTO_PRIORITY: RegistryKind[] = [
   "openrouter",
   "openai",
   "anthropic",
   "google",
   "groq",
   "deepseek",
+  "ollama-cloud",
 ];
 
 // OpenRouter cheaper / faster tier — used for `fast` and `cheapest` modes.
@@ -240,19 +282,28 @@ function hasKey(def: ProviderDef): boolean {
   return Boolean(process.env[def.envKey]);
 }
 
+/** The raw active selection: a registry kind OR an installed CLI provider id. */
+export type ActiveSelection = RegistryKind | CliProviderId;
+
 /**
- * Resolve the active provider id from the live environment.
- *   - `SKILLOS_PROVIDER` if set AND usable (keyless, or its key is present);
+ * Resolve the active selection from the live environment. Like `activeProvider`,
+ * but preserves the concrete CLI id when an installed AI CLI is the active
+ * provider (so `resolveProvider` can route the loop through it).
+ *   - `SKILLOS_PROVIDER` if it names an INSTALLED CLI → that CLI id;
+ *   - `SKILLOS_PROVIDER` if a registry id that's usable (keyless, or key present);
  *   - else the first AUTO_PRIORITY provider whose key is set;
  *   - else `ollama` if `OLLAMA_BASE_URL` is configured;
  *   - else `mock` (offline).
- * This preserves today's behavior: with only OPENROUTER_API_KEY set, active is
- * openrouter; with nothing set, active is mock.
+ * A CLI selected but not installed at startup is NOT usable — we fall through to
+ * auto-detect so the loop never points at a missing binary.
  */
-export function activeProvider(): ProviderKind {
-  const explicit = process.env.SKILLOS_PROVIDER as ProviderKind | undefined;
-  if (explicit && PROVIDER_REGISTRY[explicit]) {
-    const def = PROVIDER_REGISTRY[explicit];
+export function activeSelection(): ActiveSelection {
+  const explicit = process.env.SKILLOS_PROVIDER as string | undefined;
+  if (explicit && isCliProviderId(explicit)) {
+    if (isCliInstalled(explicit)) return explicit;
+    // Selected CLI isn't installed (this process) — fall through to auto-detect.
+  } else if (explicit && (PROVIDER_REGISTRY as Record<string, ProviderDef>)[explicit]) {
+    const def = PROVIDER_REGISTRY[explicit as RegistryKind];
     if (def.id === "ollama") {
       if (process.env.OLLAMA_BASE_URL) return "ollama";
     } else if (!def.needsKey || hasKey(def)) {
@@ -265,6 +316,17 @@ export function activeProvider(): ProviderKind {
   }
   if (process.env.OLLAMA_BASE_URL) return "ollama";
   return "mock";
+}
+
+/**
+ * Resolve the active provider KIND from the live environment. A CLI selection
+ * collapses to the `cli` kind here; use `activeSelection()` when you need the
+ * concrete CLI id. Preserves today's behavior for registry providers: with only
+ * OPENROUTER_API_KEY set, active is openrouter; with nothing set, active is mock.
+ */
+export function activeProvider(): ProviderKind {
+  const sel = activeSelection();
+  return isCliProviderId(sel) ? "cli" : sel;
 }
 
 function openrouterSlug(logical: Logical, mode: RouteMode): string {
@@ -290,12 +352,19 @@ export function resolveProvider(
   if (mode === "local" && process.env.OLLAMA_BASE_URL) {
     return resolveFor("ollama", logical, mode);
   }
-  return resolveFor(activeProvider(), logical, mode);
+  const sel = activeSelection();
+  // An installed AI CLI as the active provider: the whole loop streams through
+  // that CLI (its own auth, no SkillOS key). Carry the CLI id on the Resolution;
+  // `model` doubles as the CLI id for `done` metadata.
+  if (isCliProviderId(sel)) {
+    return { kind: "cli", model: sel, provider: `cli:${sel}`, cliId: sel };
+  }
+  return resolveFor(sel, logical, mode);
 }
 
-/** Resolve a logical-or-concrete model for a specific provider id. */
+/** Resolve a logical-or-concrete model for a specific registry provider id. */
 function resolveFor(
-  id: ProviderKind,
+  id: RegistryKind,
   logical: string,
   mode: RouteMode,
 ): Resolution {
@@ -317,34 +386,110 @@ function resolveFor(
 // Introspection helpers for the runtime pickers (`/provider`, `/models`).
 // ---------------------------------------------------------------------------
 
+/** Grouping for the unified `/provider` picker. */
+export type ProviderGroup = "api" | "local" | "cli";
+
 export interface ProviderInfo {
-  id: ProviderKind;
+  /** Registry id OR a CLI provider id (for `group === "cli"`). */
+  id: RegistryKind | CliProviderId;
   label: string;
   needsKey: boolean;
+  /** Key present (registry providers) — always false for CLI providers. */
   hasKey: boolean;
   active: boolean;
+  /** Which section of the picker this belongs to. */
+  group: ProviderGroup;
+  /** For CLI providers: whether the binary was detected installed at startup. */
+  installed?: boolean;
 }
 
-/** List all providers with live key/active status, for the `/provider` picker. */
+/** Default order of the API-key registry providers in the picker. */
+const API_ORDER: RegistryKind[] = [
+  "openai",
+  "anthropic",
+  "google",
+  "groq",
+  "deepseek",
+  "openrouter",
+];
+
+/**
+ * List ALL selectable backends with live status, for the unified `/provider`
+ * picker. Three groups, in order: API providers, local/hosted (Ollama local +
+ * Ollama Cloud), then installed CLI tools (their own auth, no key). The active
+ * selection (registry kind OR CLI id) is marked. `mock` is intentionally NOT
+ * listed here — "Skip (mock)" is offered separately by the picker UI.
+ */
 export function providerInfo(): ProviderInfo[] {
-  const active = activeProvider();
-  return (Object.keys(PROVIDER_REGISTRY) as ProviderKind[]).map((id) => {
+  const sel = activeSelection();
+  const out: ProviderInfo[] = [];
+
+  // 1) API providers.
+  for (const id of API_ORDER) {
     const def = PROVIDER_REGISTRY[id];
-    const keyed = id === "ollama" ? Boolean(process.env.OLLAMA_BASE_URL) : hasKey(def);
-    return {
+    out.push({
       id,
       label: def.label,
       needsKey: def.needsKey,
-      hasKey: keyed,
-      active: id === active,
-    };
+      hasKey: hasKey(def),
+      active: sel === id,
+      group: "api",
+    });
+  }
+
+  // 2) Local / hosted: Ollama (local, keyless) + Ollama Cloud (key).
+  const ollama = PROVIDER_REGISTRY.ollama;
+  out.push({
+    id: "ollama",
+    label: ollama.label,
+    needsKey: ollama.needsKey,
+    hasKey: Boolean(process.env.OLLAMA_BASE_URL),
+    active: sel === "ollama",
+    group: "local",
   });
+  const cloud = PROVIDER_REGISTRY["ollama-cloud"];
+  out.push({
+    id: "ollama-cloud",
+    label: cloud.label,
+    needsKey: cloud.needsKey,
+    hasKey: hasKey(cloud),
+    active: sel === "ollama-cloud",
+    group: "local",
+  });
+
+  // 3) Installed CLI tools (use their own login — no SkillOS key).
+  for (const id of CLI_PROVIDER_BRIDGES) {
+    out.push({
+      id,
+      label: CLI_LABELS[id],
+      needsKey: false,
+      hasKey: false,
+      active: sel === id,
+      group: "cli",
+      installed: isCliInstalled(id),
+    });
+  }
+
+  return out;
 }
 
-/** The selectable model ids for a provider (defaults to the active provider). */
-export function modelsFor(providerId?: ProviderKind): string[] {
+/** Human labels for the CLI provider options in the picker. */
+const CLI_LABELS: Record<CliProviderId, string> = {
+  "claude-code": "Claude Code",
+  gemini: "Gemini",
+  opencode: "OpenCode",
+  "kilo-code": "Kilo Code",
+};
+
+/**
+ * The selectable model ids for a provider (defaults to the active provider).
+ * CLI providers have no SkillOS-side model list (the CLI picks its own model),
+ * so this returns an empty list for them.
+ */
+export function modelsFor(providerId?: ProviderKind | RegistryKind): string[] {
   const id = providerId ?? activeProvider();
-  return PROVIDER_REGISTRY[id].models;
+  if (id === "cli") return [];
+  return PROVIDER_REGISTRY[id as RegistryKind].models;
 }
 
 // ---------------------------------------------------------------------------
@@ -371,10 +516,22 @@ function sdkModel(kind: ProviderKind, model: string): LanguageModel {
         baseURL: "https://openrouter.ai/api/v1",
         apiKey: process.env.OPENROUTER_API_KEY,
       })(model);
+    case "ollama-cloud":
+      // Hosted Ollama exposes an OpenAI-compatible endpoint. Base URL overridable
+      // via OLLAMA_CLOUD_URL; key read live from OLLAMA_API_KEY.
+      return createOpenAI({
+        baseURL: process.env.OLLAMA_CLOUD_URL ?? "https://ollama.com/v1",
+        apiKey: process.env.OLLAMA_API_KEY,
+      })(model);
     default:
       throw new Error(`No SDK factory for provider "${kind}".`);
   }
 }
+
+/** Generous default for a CLI-as-provider turn (CLIs cold-start + think). */
+const CLI_PROVIDER_TIMEOUT_MS = Number(
+  process.env.SKILLOS_CLI_TIMEOUT_MS ?? 120000,
+);
 
 export async function* streamCompletion(
   res: Resolution,
@@ -387,7 +544,8 @@ export async function* streamCompletion(
     case "google":
     case "groq":
     case "deepseek":
-    case "openrouter": {
+    case "openrouter":
+    case "ollama-cloud": {
       const result = streamText({ model: sdkModel(res.kind, res.model), system, prompt });
       for await (const delta of result.textStream) yield delta;
       return;
@@ -395,10 +553,82 @@ export async function* streamCompletion(
     case "ollama":
       yield* streamOllama(res.model, system, prompt);
       return;
+    case "cli":
+      yield* streamCli(res.cliId ?? (res.model as CliProviderId), system, prompt);
+      return;
     case "mock":
       yield* streamMock(res.model, system, prompt);
       return;
   }
+}
+
+/**
+ * Stream a turn THROUGH an installed AI CLI (Claude Code / Gemini / OpenCode /
+ * Kilo Code) acting as the active provider. The skill/system prompt is folded
+ * into ONE combined prompt (CLIs take a single prompt string), then the bridge's
+ * `ask` capability is run via `runCliAsk`, which spawns the CLI with its own auth
+ * and streams stdout back. Honors a bounded timeout; on failure throws a clear
+ * error so the caller surfaces it (never hangs).
+ *
+ * Bridge output arrives via a callback, so we adapt it to an async generator
+ * with a small queue + a promise the consumer awaits between yields.
+ */
+async function* streamCli(
+  cliId: CliProviderId,
+  system: string,
+  prompt: string,
+): AsyncGenerator<string> {
+  const combined = combinePrompt(system, prompt);
+
+  // Callback → async-iterator bridge.
+  const queue: string[] = [];
+  let notify: (() => void) | null = null;
+  let finished = false;
+  let failure: string | null = null;
+
+  const wake = () => {
+    if (notify) {
+      const n = notify;
+      notify = null;
+      n();
+    }
+  };
+
+  const runPromise = runCliAsk(
+    cliId,
+    combined,
+    (text) => {
+      queue.push(text);
+      wake();
+    },
+    CLI_PROVIDER_TIMEOUT_MS,
+  ).then((r) => {
+    if (!r.ok) failure = r.error ?? `${cliId} CLI failed.`;
+    finished = true;
+    wake();
+  });
+
+  for (;;) {
+    if (queue.length > 0) {
+      yield queue.shift()!;
+      continue;
+    }
+    if (finished) break;
+    await new Promise<void>((resolve) => {
+      notify = resolve;
+    });
+  }
+  await runPromise; // ensure the run settled
+  if (failure && queue.length === 0) {
+    throw new Error(failure);
+  }
+}
+
+/** Fold a system prompt + user prompt into a single CLI prompt string. */
+function combinePrompt(system: string, prompt: string): string {
+  const sys = system.trim();
+  if (!sys) return prompt;
+  return `${sys}\n\n---\n\n${prompt}`;
 }
 
 async function* streamOllama(

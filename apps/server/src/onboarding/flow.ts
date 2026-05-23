@@ -77,7 +77,15 @@ export const PROVIDERS: {
   { key: "5", label: "Groq — fast Llama", value: "groq", needsKey: true },
   { key: "6", label: "DeepSeek", value: "deepseek", needsKey: true },
   { key: "7", label: "Ollama — local models, no key (must be running)", value: "ollama", needsKey: false },
-  { key: "8", label: "Skip for now — demo with built-in mock responses", value: "skip", needsKey: false },
+  { key: "8", label: "Ollama Cloud — hosted open models (key from ollama.com)", value: "ollama-cloud", needsKey: true },
+  // Installed AI CLIs use their OWN login — no SkillOS key. If the binary isn't
+  // installed, applyProviderChoice still records the choice; switch via /provider
+  // (which detects installs) or install it and restart. They route the whole loop.
+  { key: "9", label: "Claude Code CLI — uses your Claude Code login (no key)", value: "claude-code", needsKey: false },
+  { key: "10", label: "Gemini CLI — uses your Gemini CLI login (no key)", value: "gemini", needsKey: false },
+  { key: "11", label: "OpenCode CLI — uses your OpenCode config (no key)", value: "opencode", needsKey: false },
+  { key: "12", label: "Kilo Code CLI — uses your Kilo Code config (no key)", value: "kilo-code", needsKey: false },
+  { key: "13", label: "Skip for now — demo with built-in mock responses", value: "skip", needsKey: false },
 ];
 
 /** Human label for a provider value (for the apiKey prompt). */

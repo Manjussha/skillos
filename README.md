@@ -52,7 +52,7 @@ You → Terminal → Command Parser → Skill Engine → Model Router → Provid
 
 - 🧩 **Portable skills** — prompt/tool/agent skills as plain **Markdown or JSON** files. Drop a file in `skills/`, it's instantly available. No code change.
 - 🔀 **Intelligent model routing** — rule-based routing maps each task to the best model; a `mode` (fast / best / cheapest / **local-private**) biases provider + model tier per request.
-- 🌐 **Multi-provider** — OpenAI, **Claude (Anthropic)**, **Gemini**, **DeepSeek**, **Groq**, **OpenRouter** (one key, many models), and **Ollama** (local models) via the Vercel AI SDK — plus an offline **mock** provider.
+- 🌐 **Multi-provider** — OpenAI, **Claude (Anthropic)**, **Gemini**, **DeepSeek**, **Groq**, **OpenRouter** (one key, many models), **Ollama** (local) and **Ollama Cloud** (hosted) via the Vercel AI SDK — plus an offline **mock** provider. You can also pick an **installed AI CLI** (Claude Code, Gemini CLI, OpenCode, Kilo Code) as the active backend: the whole loop streams through that CLI using **its own login** — no SkillOS key.
 - 🤖 **AI agents & workflows** — built-in **Planner → Coder → Reviewer → Writer**; chain them with `/build-dashboard`, `/build-api`. Real stage-to-stage context passing.
 - 🪄 **Personalized onboarding** — first-run setup learns your use-case, stack, and mode; **auto-loads** relevant skills and can **auto-generate** new skills for your domain.
 - 📡 **Remote access** — `/remote start` opens a **Cloudflare Tunnel** with a public URL + **QR code**, **scoped expiring session tokens**, and a permission gate that prompts before privileged tools run remotely.
@@ -94,7 +94,7 @@ Then try:
 /remote start                          # public URL + QR (degrades gracefully)
 ```
 
-**Want real models?** Pick a provider during onboarding — **OpenRouter** (one key, many models) or a direct provider (**OpenAI / Anthropic / Google / Groq / DeepSeek**) — and paste its key (saved to `.env`, applied instantly — no restart), or run [Ollama](https://ollama.com) locally for private, on-device AI. Switch providers any time at runtime with **`/provider`** (lists all providers, marks the active one and which already have a key) and pick a specific model with **`/models`**. The active provider is remembered via `SKILLOS_PROVIDER`.
+**Want real models?** Pick a provider during onboarding — **OpenRouter** (one key, many models) or a direct provider (**OpenAI / Anthropic / Google / Groq / DeepSeek**) — and paste its key (saved to `.env`, applied instantly — no restart), run [Ollama](https://ollama.com) locally / **Ollama Cloud** (hosted) for open models, or select an **installed AI CLI** (Claude Code, Gemini, OpenCode, Kilo Code) to route the whole loop through it on its own login. Switch any time at runtime with **`/provider`** — a single grouped menu (API providers · Local/hosted · installed CLI tools) that marks the active one, which providers already have a key, and which CLIs are installed — and pick a specific model with **`/models`**. The active selection is remembered via `SKILLOS_PROVIDER`. (CLIs are detected at startup; install a new one and restart for it to appear.)
 
 ---
 

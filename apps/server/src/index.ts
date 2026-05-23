@@ -12,6 +12,7 @@ import {
   providerInfo,
   modelsFor,
   activeProvider,
+  activeSelection,
   type RouteMode,
 } from "./providers/provider.js";
 import type { ClientMessage, ServerMessage, Skill } from "./types.js";
@@ -72,6 +73,9 @@ import {
   listConnected,
   resolveWrapper,
   availableTargets,
+  detectCliProviders,
+  cliInstallSnapshot,
+  isCliProviderId,
 } from "./bridges/registry.js";
 import type { Bridge, BridgeSink } from "./bridges/types.js";
 
@@ -136,6 +140,22 @@ console.log(`[skillos] loaded ${skills.size} skills from ${dir}`);
 // Initialize persistence before accepting connections so failures surface early.
 await ensureDb();
 console.log("[skillos] database ready");
+
+// Detect installed AI CLIs ONCE at startup (parallel, short timeout) and cache
+// the result for the process. The `/provider` picker reads this cache so it never
+// spawns `<bin> --version` per render (gemini cold-start alone is ~6s). New CLI
+// installs require a server restart to appear in the picker.
+await detectCliProviders();
+{
+  const snap = cliInstallSnapshot();
+  const ready = Object.entries(snap)
+    .filter(([, v]) => v)
+    .map(([k]) => k);
+  console.log(
+    `[skillos] CLI providers detected: ${ready.length ? ready.join(", ") : "none"} ` +
+      `(installed: ${JSON.stringify(snap)})`,
+  );
+}
 
 // Layer 4: attach the WebSocket server to an http.Server so cloudflared (which
 // tunnels HTTP and upgrades to WS) can reach the gateway. ws://localhost:8787
@@ -674,8 +694,10 @@ async function doGenerateSkills(ws: WebSocket, description: string): Promise<voi
 
 /** Human-readable label for the currently-active backend (id + key/endpoint). */
 function activeBackend(): string {
-  const id = activeProvider();
-  return id === "mock" ? "mock (offline)" : id;
+  const sel = activeSelection();
+  if (sel === "mock") return "mock (offline)";
+  if (isCliProviderId(sel)) return `${sel} (CLI)`;
+  return sel;
 }
 
 /**
@@ -693,18 +715,48 @@ function startProviderPicker(ws: WebSocket, session: Session): void {
     return;
   }
   session.picker = { kind: "provider" };
-  const lines = providerInfo().map((p, i) => {
+
+  // One numbered, grouped list. The numbering is GLOBAL across groups so the
+  // user types a single number; group headers are non-numbered lines. The
+  // ordering matches providerInfo() (api → local → cli), and "Skip (mock)" is
+  // appended last with its own number.
+  const info = providerInfo();
+  const lines: string[] = [];
+  let n = 0;
+  let lastGroup: string | null = null;
+  const groupHeader: Record<string, string> = {
+    api: "API providers (key):",
+    local: "Local / hosted:",
+    cli: "Installed CLI tools (use their own login — no key):",
+  };
+  for (const p of info) {
+    if (p.group !== lastGroup) {
+      lines.push(`  ${groupHeader[p.group]}`);
+      lastGroup = p.group;
+    }
+    n += 1;
     const active = p.active ? " *" : "";
-    const keyed = p.hasKey ? " ✓" : "";
-    const need = p.needsKey && !p.hasKey ? " (needs key)" : "";
-    return `  ${i + 1}) ${p.label}${need}${keyed}${active}`;
-  });
+    if (p.group === "cli") {
+      const inst = p.installed ? " ✓ installed" : " ✗ not installed";
+      lines.push(`    ${n}) ${p.label}${inst}${active}`);
+    } else {
+      const keyed = p.hasKey ? " ✓" : "";
+      const need = p.needsKey && !p.hasKey ? " (needs key)" : "";
+      lines.push(`    ${n}) ${p.label}${need}${keyed}${active}`);
+    }
+  }
+  // Trailing "Skip (mock)" option keeps the offline path one keystroke away.
+  n += 1;
+  lines.push("  Other:");
+  lines.push(`    ${n}) Skip (mock / offline)`);
+
   send(ws, {
     type: "info",
     text: [
-      `Active provider: ${activeBackend()}.  (* = active, ✓ = key set)`,
-      "Choose a provider by number (or type a /command to cancel):",
+      `Active provider: ${activeBackend()}.  (* = active, ✓ = key set / installed)`,
+      "Choose by number (or type a /command to cancel):",
       ...lines,
+      "(CLI tools use their own auth — selecting one routes the whole loop through it.)",
     ].join("\n"),
   });
 }
@@ -751,9 +803,32 @@ async function advancePicker(
     const choice = text.toLowerCase();
     const list = providerInfo();
     const n = Number(choice);
+    // Numbering is GLOBAL: 1..list.length are the grouped entries, and
+    // list.length+1 is the trailing "Skip (mock)" option. "skip"/"mock" by name
+    // also selects it.
+    const skipNum = list.length + 1;
+    const isSkip =
+      (Number.isInteger(n) && n === skipNum) ||
+      choice === "skip" ||
+      choice === "mock";
+    if (isSkip) {
+      const env = await applyProviderChoice("skip", "");
+      session.picker = null;
+      send(ws, {
+        type: "info",
+        text: `${env.message}\nActive provider: ${activeBackend()}.`,
+      });
+      return endTurn(ws);
+    }
+
     const byNum =
       Number.isInteger(n) && n >= 1 && n <= list.length ? list[n - 1] : undefined;
-    const byId = list.find((p) => p.id === choice || p.id === choice.replace(/\s+/g, ""));
+    const byId = list.find(
+      (p) =>
+        p.id === choice ||
+        p.id === choice.replace(/\s+/g, "") ||
+        p.label.toLowerCase() === choice,
+    );
     const picked = byNum ?? byId;
     if (!picked) {
       // Unrecognized — cancel cleanly so the user isn't stuck.
@@ -764,9 +839,41 @@ async function advancePicker(
       });
       return endTurn(ws);
     }
+
+    // CLI tool selected: it uses its OWN login (no SkillOS key). If it isn't
+    // installed, say so + show the install hint and do NOT activate. Otherwise
+    // set it active (SKILLOS_PROVIDER=<cliId> via applyProviderChoice) and ensure
+    // its bridge is connected so the loop can stream through it.
+    if (picked.group === "cli") {
+      const cliId = String(picked.id);
+      if (!picked.installed) {
+        session.picker = null;
+        const result = await connectBridge(cliId); // populates bridge.note (hint)
+        const hint = result.bridge?.note ?? "Install it, then restart SkillOS.";
+        send(ws, {
+          type: "info",
+          text:
+            `${picked.label} is not installed — not activated.\n${hint}\n` +
+            `(Install it and RESTART SkillOS so the picker re-detects it.)`,
+        });
+        return endTurn(ws);
+      }
+      // Installed → activate + connect the bridge so streamCompletion can proxy.
+      await connectBridge(cliId);
+      const env = await applyProviderChoice(cliId, "");
+      session.picker = null;
+      send(ws, {
+        type: "info",
+        text:
+          `${env.message}\nActive provider: ${activeBackend()}. ` +
+          `The whole loop now streams through the ${picked.label} CLI (its own auth).`,
+      });
+      return endTurn(ws);
+    }
+
     // A key-based provider without a key yet → advance to the apiKey step.
     if (picked.needsKey && !picked.hasKey) {
-      session.picker = { kind: "apiKey", provider: picked.id };
+      session.picker = { kind: "apiKey", provider: String(picked.id) };
       send(ws, {
         type: "info",
         text:
@@ -776,7 +883,7 @@ async function advancePicker(
       return endTurn(ws);
     }
     // Keyless, or already keyed → switch active provider immediately.
-    const env = await applyProviderChoice(picked.id, "");
+    const env = await applyProviderChoice(String(picked.id), "");
     session.picker = null;
     send(ws, {
       type: "info",
@@ -1100,8 +1207,8 @@ function lastModelFor(_workflow: string, agentName: string): string {
 // ---------------------------------------------------------------------------
 
 /**
- * `/connect <target>` (shell | aider | claude-code | gemini | opencode). Runs
- * the bridge's detection, registers it, and reports the generated wrappers.
+ * `/connect <target>` (shell | aider | claude-code | gemini | opencode |
+ * kilo-code). Runs the bridge's detection, registers it, and reports the wrappers.
  * Graceful by design: a missing external tool (e.g. aider, claude, opencode)
  * connects as "unavailable" with an install hint — never an error — so the
  * bridge mechanism is demonstrable offline. The external AI-CLI bridges proxy to
@@ -1375,7 +1482,7 @@ function sendHelp(ws: WebSocket): void {
       "  /remote start [--shell]  open remote access (tunnel + token + QR)",
       "  /remote status         show remote state, URL, active tokens",
       "  /remote stop           tear down the tunnel and revoke tokens",
-      "  /connect <target>      connect a terminal bridge (shell | aider | claude-code | gemini | opencode)",
+      "  /connect <target>      connect a terminal bridge (shell | aider | claude-code | gemini | opencode | kilo-code)",
       "  /bridges               list connected bridges + their capabilities",
       "  /run <skill|wrapped> … run a skill or a connected bridge command",
       "  /<skill> …             shortcut to run a skill",

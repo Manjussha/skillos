@@ -23,6 +23,8 @@ const PROVIDER_KEYS = [
   "GROQ_API_KEY",
   "DEEPSEEK_API_KEY",
   "OLLAMA_BASE_URL",
+  "OLLAMA_API_KEY",
+  "OLLAMA_CLOUD_URL",
   "SKILLOS_PROVIDER",
 ];
 
@@ -151,11 +153,38 @@ clearEnv();
   );
   check("providerInfo active is anthropic", active?.id === "anthropic", active?.id);
   check("providerInfo anthropic.hasKey true", anth?.hasKey === true);
+  // Unified picker: 6 API providers + 2 local/hosted (ollama, ollama-cloud) +
+  // 4 installed-CLI options (claude-code, gemini, opencode, kilo-code) = 12.
+  // mock is intentionally NOT listed (offered as a separate "Skip" option).
   check(
-    "providerInfo lists all 8 providers",
-    info.length === 8,
+    "providerInfo lists 12 unified options (api+local+cli)",
+    info.length === 12,
     String(info.length),
   );
+  const cloud = info.find((p) => p.id === "ollama-cloud");
+  check("providerInfo includes Ollama Cloud (local group)", cloud?.group === "local", cloud?.group);
+  const cliOpts = info.filter((p) => p.group === "cli").map((p) => p.id);
+  check(
+    "providerInfo includes the 4 CLI tools",
+    ["claude-code", "gemini", "opencode", "kilo-code"].every((id) => cliOpts.includes(id)),
+    cliOpts.join(", "),
+  );
+  check(
+    "CLI options carry an `installed` boolean",
+    info.filter((p) => p.group === "cli").every((p) => typeof p.installed === "boolean"),
+  );
+}
+
+// 8) Ollama Cloud: explicit selection with OLLAMA_API_KEY → kind ollama-cloud,
+//    cloud model id, base URL overridable.
+clearEnv();
+{
+  process.env.OLLAMA_API_KEY = "sk-ollama-test";
+  process.env.SKILLOS_PROVIDER = "ollama-cloud";
+  const r = resolveProvider("default", "best");
+  console.log(`[ollama-cloud] resolveProvider("default","best") =>`, r);
+  check("ollama-cloud explicit → kind ollama-cloud", r.kind === "ollama-cloud", r.kind);
+  check("ollama-cloud → a gpt-oss model", /gpt-oss/.test(r.model), r.model);
 }
 
 clearEnv();

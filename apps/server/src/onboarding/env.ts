@@ -1,6 +1,7 @@
 import { readFile, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
-import { PROVIDER_REGISTRY, type ProviderKind } from "../providers/provider.js";
+import { PROVIDER_REGISTRY, type RegistryKind } from "../providers/provider.js";
+import { isCliProviderId } from "../bridges/registry.js";
 
 /**
  * Persist a provider choice (from onboarding or the runtime `/provider` picker)
@@ -42,15 +43,27 @@ export interface ProviderApplied {
 
 /**
  * Apply a provider choice. `providerId` is a registry id (openai, anthropic,
- * google, groq, deepseek, openrouter, ollama, mock) or "skip" (alias for mock).
- * For key-based providers, `apiKey` is written to that provider's env var; for
- * ollama/mock/skip no key is written.
+ * google, groq, deepseek, openrouter, ollama, ollama-cloud, mock), an installed
+ * AI CLI id (claude-code, gemini, opencode, kilo-code), or "skip" (alias for
+ * mock). For key-based providers, `apiKey` is written to that provider's env var;
+ * for ollama/cli/mock/skip no key is written (CLIs use their own auth).
  */
 export async function applyProviderChoice(
   providerId: string,
   apiKey: string,
 ): Promise<ProviderApplied> {
-  const id = providerId === "skip" ? "mock" : (providerId as ProviderKind);
+  // CLI-backed provider: no SkillOS key — it uses its own login. We only make it
+  // the sticky active selection. Detection/connection happens in index.ts.
+  if (isCliProviderId(providerId)) {
+    process.env.SKILLOS_PROVIDER = providerId;
+    await upsertEnv({ SKILLOS_PROVIDER: providerId });
+    return {
+      applied: true,
+      message: `Active provider set to the ${providerId} CLI (uses its own auth — no SkillOS key).`,
+    };
+  }
+
+  const id = providerId === "skip" ? "mock" : (providerId as RegistryKind);
   const def = PROVIDER_REGISTRY[id];
 
   // Unknown provider id — leave the environment untouched.

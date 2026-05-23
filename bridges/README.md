@@ -21,7 +21,16 @@ directory is the conceptual home + docs). Modules:
 | `claude-code.ts` | Claude Code CLI bridge (`claude -p`). Uses your Claude Code auth. |
 | `gemini-cli.ts` | Gemini CLI bridge (`gemini -p`, stdin fallback). Uses your Gemini auth. |
 | `opencode.ts` | OpenCode CLI bridge (`opencode run`). Uses your OpenCode provider config. |
-| `registry.ts` | Tracks connected bridges + generates `/run`-able wrappers. |
+| `kilo-code.ts` | Kilo Code CLI bridge (`kilocode`/`kilo run`). Uses your Kilo Code config. |
+| `registry.ts` | Tracks connected bridges + generates `/run`-able wrappers; also caches startup CLI detection + the `runCliAsk` proxy used by the provider layer. |
+
+> 💡 **The AI-CLI bridges do double duty.** Besides `/connect` + `/run`, each is
+> selectable as the **active LLM provider** via `/provider` — selecting one routes
+> the *whole* core loop (free prompts and skills) through that CLI on its own
+> login (no SkillOS key). See `apps/server/src/providers/provider.ts` (the `cli`
+> resolution kind + `streamCompletion`'s `cli` case → `runCliAsk`). The CLI ids
+> that opt into this are listed in `CLI_PROVIDER_BRIDGES` in `registry.ts`, and
+> they're detected once at startup (`detectCliProviders`, cached per process).
 
 ## The bridge interface (`types.ts`)
 
@@ -47,7 +56,7 @@ interface, so spawning/parsing differences stay inside each module.
 
 | Command | What it does |
 | --- | --- |
-| `/connect <target>` | Connect a bridge (`shell` \| `aider` \| `claude-code` \| `gemini` \| `opencode`): run detection, register it, generate wrappers, report status. |
+| `/connect <target>` | Connect a bridge (`shell` \| `aider` \| `claude-code` \| `gemini` \| `opencode` \| `kilo-code`): run detection, register it, generate wrappers, report status. |
 | `/bridges` | List connected bridges with status + capabilities + commands. |
 | `/run <wrapped> …` | Proxy to a connected bridge command (falls back to normal skills if the name isn't a bridge wrapper). |
 
@@ -114,9 +123,9 @@ The first AI-terminal target. `/connect aider`:
 
 This makes the whole layer verifiable offline (see `scripts/verify-layer5.mjs`).
 
-## External AI-CLI bridges (`claude-code.ts`, `gemini-cli.ts`, `opencode.ts`)
+## External AI-CLI bridges (`claude-code.ts`, `gemini-cli.ts`, `opencode.ts`, `kilo-code.ts`)
 
-Three bridges wrap popular external AI coding CLIs so you can drive them from
+Four bridges wrap popular external AI coding CLIs so you can drive them from
 SkillOS using **their** auth instead of a SkillOS API key:
 
 | Target (`/connect …`) | Binary | Detection | Non-interactive proxy | Capabilities |
@@ -124,6 +133,21 @@ SkillOS using **their** auth instead of a SkillOS API key:
 | `claude-code` | `claude` | `claude --version` | `claude -p "<prompt>"` (print/headless) | `ask`, `edit` |
 | `gemini` | `gemini` | `gemini --version` | `gemini -p "<prompt>"`, **stdin fallback** | `ask` |
 | `opencode` | `opencode` | `opencode --version` | `opencode run "<prompt>"` | `ask`, `edit` |
+| `kilo-code` | `kilocode` then `kilo` | `<bin> --version` | `<bin> run "<prompt>"` | `ask`, `edit` |
+
+> ⚠️ **Kilo Code binary uncertainty (honest gap).** Kilo Code is primarily an
+> IDE extension; its standalone CLI surface is less standardized than the others.
+> The bridge best-guesses the binary (`kilocode`, then `kilo`) and the
+> `<bin> run "<prompt>"` invocation. If your install differs, the bridge degrades
+> gracefully (unavailable + install hint) — adjust `BIN_CANDIDATES` / the run
+> args in `kilo-code.ts` if your CLI uses a different name or subcommand.
+
+**Also usable as the active provider.** Every CLI in `CLI_PROVIDER_BRIDGES`
+(claude-code, gemini, opencode, kilo-code) can be selected via `/provider` to
+back the *entire* core loop, not just `/run`. The provider layer combines the
+skill/system prompt + the user prompt into one string and runs it through the
+bridge's `ask` capability (`runCliAsk`), streaming stdout back. Same auth model
+(the CLI's own login), bounded by a timeout so a stuck CLI never hangs the turn.
 
 **Uses your existing CLI subscription/auth — no SkillOS key needed.** Each bridge
 spawns the user's locally-installed CLI, which carries its own credentials
@@ -143,6 +167,7 @@ Install hints:
 - Claude Code: `npm i -g @anthropic-ai/claude-code` then sign in — https://docs.claude.com/claude-code
 - Gemini CLI: `npm i -g @google/gemini-cli` then authenticate — https://github.com/google-gemini/gemini-cli
 - OpenCode: `npm i -g opencode-ai` then configure a provider — https://opencode.ai
+- Kilo Code: primarily an IDE extension — https://kilocode.ai (expose a `kilocode`/`kilo` CLI on PATH if available)
 
 **Permission gating** is unchanged: `ask` capabilities declare no privileged
 tools (chat-only), while `edit` capabilities declare `["filesystem","shell"]`,
