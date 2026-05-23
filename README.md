@@ -1,6 +1,8 @@
 <div align="center">
 
-# 🧠 SkillOS
+<img src="assets/brand/social-banner.png" alt="SkillOS — open-source AI terminal hub with intelligent multi-model routing, portable skills, and AI agents" width="840">
+
+# SkillOS
 
 ### The open-source AI terminal hub — intelligent multi-model routing, portable skills, agents, and remote access. Local-first. Hackable. Terminal-native.
 

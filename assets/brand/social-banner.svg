@@ -1,0 +1,78 @@
+<svg width="1280" height="640" viewBox="0 0 1280 640" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="SkillOS — open-source AI terminal hub">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1280" y2="640" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#0d1220"/>
+      <stop offset="1" stop-color="#070a10"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="80" y1="250" x2="520" y2="340" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#22c55e"/>
+      <stop offset="1" stop-color="#22d3ee"/>
+    </linearGradient>
+    <filter id="soft" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur stdDeviation="6" result="b"/>
+      <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+  </defs>
+
+  <rect width="1280" height="640" fill="url(#bg)"/>
+
+  <!-- faint grid -->
+  <g stroke="#16203200" opacity="0.5">
+    <g stroke="#172234" stroke-width="1">
+      <path d="M0 80H1280M0 160H1280M0 240H1280M0 320H1280M0 400H1280M0 480H1280M0 560H1280"/>
+      <path d="M80 0V640M160 0V640M240 0V640M320 0V640M400 0V640M480 0V640M560 0V640M640 0V640M720 0V640M800 0V640M880 0V640M960 0V640M1040 0V640M1120 0V640M1200 0V640"/>
+    </g>
+  </g>
+  <!-- glow blob -->
+  <circle cx="980" cy="160" r="220" fill="#22c55e" opacity="0.07"/>
+  <circle cx="240" cy="520" r="200" fill="#22d3ee" opacity="0.06"/>
+
+  <!-- LEFT: wordmark + tagline -->
+  <g font-family="'Segoe UI', Inter, Helvetica, Arial, sans-serif">
+    <!-- small prompt glyph -->
+    <g stroke="url(#accent)" stroke-width="11" stroke-linecap="round" stroke-linejoin="round" fill="none">
+      <polyline points="80,150 116,176 80,202"/>
+    </g>
+    <rect x="128" y="190" width="42" height="13" rx="6" fill="#22d3ee"/>
+
+    <text x="78" y="320" font-size="118" font-weight="800" fill="#e6ebff" letter-spacing="-2">SkillOS</text>
+    <rect x="560" y="232" width="26" height="96" rx="4" fill="#22c55e" filter="url(#soft)"/>
+
+    <text x="82" y="386" font-size="34" font-weight="600" fill="#c8d3f5">Open-source AI terminal hub</text>
+    <text x="82" y="432" font-size="25" fill="#7c8aa8">multi-model routing · skills · agents · remote access</text>
+
+    <!-- mini badges -->
+    <g font-size="20" font-weight="600">
+      <rect x="82" y="470" width="150" height="40" rx="20" fill="#0e1a12" stroke="#1c5132"/>
+      <text x="104" y="496" fill="#34d36b">local-first</text>
+      <rect x="244" y="470" width="160" height="40" rx="20" fill="#0c1820" stroke="#15455a"/>
+      <text x="266" y="496" fill="#38cde6">TypeScript</text>
+      <rect x="416" y="470" width="120" height="40" rx="20" fill="#15131f" stroke="#3a3357"/>
+      <text x="438" y="496" fill="#b9a7ff">MIT</text>
+    </g>
+  </g>
+
+  <!-- RIGHT: terminal window mockup -->
+  <g transform="translate(720,150)">
+    <rect x="0" y="0" width="500" height="340" rx="18" fill="#0a0e16" stroke="#1f2a3c" stroke-width="2"/>
+    <!-- title bar -->
+    <rect x="0" y="0" width="500" height="44" rx="18" fill="#0d131e"/>
+    <rect x="0" y="22" width="500" height="22" fill="#0d131e"/>
+    <circle cx="26" cy="22" r="7" fill="#ff5f57"/>
+    <circle cx="50" cy="22" r="7" fill="#febc2e"/>
+    <circle cx="74" cy="22" r="7" fill="#28c840"/>
+    <text x="230" y="28" font-family="monospace" font-size="16" fill="#5b6b86">skillos</text>
+
+    <!-- content -->
+    <g font-family="'Cascadia Code', 'Fira Code', Consolas, monospace" font-size="19">
+      <text x="24" y="92"><tspan fill="#34d36b" font-weight="700">skillos&gt;</tspan><tspan fill="#c8d3f5"> /build-dashboard sales app</tspan></text>
+      <text x="24" y="128" fill="#38cde6">■ planner [1/3] (claude)</text>
+      <text x="24" y="158" fill="#8595b2">  → outline: KPIs, charts, layout…</text>
+      <text x="24" y="190" fill="#38cde6">■ coder [2/3] (deepseek-coder)</text>
+      <text x="24" y="220" fill="#8595b2">  → scaffolding components…</text>
+      <text x="24" y="252" fill="#38cde6">■ reviewer [3/3] (claude)</text>
+      <text x="24" y="282" fill="#8595b2">  → checks passed ✓</text>
+      <text x="24" y="316"><tspan fill="#34d36b" font-weight="700">skillos&gt;</tspan><tspan fill="#e6ebff"> ▏</tspan></text>
+    </g>
+  </g>
+</svg>

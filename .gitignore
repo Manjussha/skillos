@@ -34,3 +34,6 @@ Thumbs.db
 # misc
 .cache/
 coverage/
+
+# local-only marketing notes
+LAUNCH.md
