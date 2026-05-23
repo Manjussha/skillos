@@ -1100,10 +1100,12 @@ function lastModelFor(_workflow: string, agentName: string): string {
 // ---------------------------------------------------------------------------
 
 /**
- * `/connect <target>` (shell | aider). Runs the bridge's detection, registers
- * it, and reports the generated wrappers. Graceful by design: a missing external
- * tool (e.g. aider) connects as "unavailable" with an install hint — never an
- * error — so the bridge mechanism is demonstrable offline.
+ * `/connect <target>` (shell | aider | claude-code | gemini | opencode). Runs
+ * the bridge's detection, registers it, and reports the generated wrappers.
+ * Graceful by design: a missing external tool (e.g. aider, claude, opencode)
+ * connects as "unavailable" with an install hint — never an error — so the
+ * bridge mechanism is demonstrable offline. The external AI-CLI bridges proxy to
+ * the user's own CLI auth/subscription; SkillOS needs no API key for them.
  */
 async function doConnect(ws: WebSocket, args: string): Promise<void> {
   const target = args.trim().split(/\s+/)[0] ?? "";
@@ -1373,7 +1375,7 @@ function sendHelp(ws: WebSocket): void {
       "  /remote start [--shell]  open remote access (tunnel + token + QR)",
       "  /remote status         show remote state, URL, active tokens",
       "  /remote stop           tear down the tunnel and revoke tokens",
-      "  /connect <target>      connect a terminal bridge (shell | aider)",
+      "  /connect <target>      connect a terminal bridge (shell | aider | claude-code | gemini | opencode)",
       "  /bridges               list connected bridges + their capabilities",
       "  /run <skill|wrapped> … run a skill or a connected bridge command",
       "  /<skill> …             shortcut to run a skill",

@@ -18,6 +18,9 @@ directory is the conceptual home + docs). Modules:
 | `types.ts` | The `Bridge` interface + helpers (the stable boundary). |
 | `shell.ts` | Local shell bridge — the simplest reference implementation. |
 | `aider.ts` | Aider bridge — first AI-terminal target, with graceful degradation. |
+| `claude-code.ts` | Claude Code CLI bridge (`claude -p`). Uses your Claude Code auth. |
+| `gemini-cli.ts` | Gemini CLI bridge (`gemini -p`, stdin fallback). Uses your Gemini auth. |
+| `opencode.ts` | OpenCode CLI bridge (`opencode run`). Uses your OpenCode provider config. |
 | `registry.ts` | Tracks connected bridges + generates `/run`-able wrappers. |
 
 ## The bridge interface (`types.ts`)
@@ -44,7 +47,7 @@ interface, so spawning/parsing differences stay inside each module.
 
 | Command | What it does |
 | --- | --- |
-| `/connect <target>` | Connect a bridge (`shell` \| `aider`): run detection, register it, generate wrappers, report status. |
+| `/connect <target>` | Connect a bridge (`shell` \| `aider` \| `claude-code` \| `gemini` \| `opencode`): run detection, register it, generate wrappers, report status. |
 | `/bridges` | List connected bridges with status + capabilities + commands. |
 | `/run <wrapped> …` | Proxy to a connected bridge command (falls back to normal skills if the name isn't a bridge wrapper). |
 
@@ -110,6 +113,47 @@ The first AI-terminal target. `/connect aider`:
   what *would* run + how to enable it — again, no crash.
 
 This makes the whole layer verifiable offline (see `scripts/verify-layer5.mjs`).
+
+## External AI-CLI bridges (`claude-code.ts`, `gemini-cli.ts`, `opencode.ts`)
+
+Three bridges wrap popular external AI coding CLIs so you can drive them from
+SkillOS using **their** auth instead of a SkillOS API key:
+
+| Target (`/connect …`) | Binary | Detection | Non-interactive proxy | Capabilities |
+| --- | --- | --- | --- | --- |
+| `claude-code` | `claude` | `claude --version` | `claude -p "<prompt>"` (print/headless) | `ask`, `edit` |
+| `gemini` | `gemini` | `gemini --version` | `gemini -p "<prompt>"`, **stdin fallback** | `ask` |
+| `opencode` | `opencode` | `opencode --version` | `opencode run "<prompt>"` | `ask`, `edit` |
+
+**Uses your existing CLI subscription/auth — no SkillOS key needed.** Each bridge
+spawns the user's locally-installed CLI, which carries its own credentials
+(Claude Code login/subscription, Gemini `GEMINI_API_KEY` or Google login,
+OpenCode provider config). SkillOS never reads or needs its own API key on these
+paths — it only spawns the binary and streams stdout/stderr back through the
+`BridgeSink`. The prompt is passed as a single argv entry (no shell
+interpolation of user text).
+
+**Graceful degradation** is identical to Aider: detection (`<bin> --version`)
+never throws; a missing binary marks the bridge `unavailable` with an install
+hint, but the static capability map is **still exposed and wrappers are still
+generated**, so the mechanism is demonstrable offline. Running a wrapper while
+unavailable returns a clear `ok:false` (with the hint) instead of crashing.
+Install hints:
+
+- Claude Code: `npm i -g @anthropic-ai/claude-code` then sign in — https://docs.claude.com/claude-code
+- Gemini CLI: `npm i -g @google/gemini-cli` then authenticate — https://github.com/google-gemini/gemini-cli
+- OpenCode: `npm i -g opencode-ai` then configure a provider — https://opencode.ai
+
+**Permission gating** is unchanged: `ask` capabilities declare no privileged
+tools (chat-only), while `edit` capabilities declare `["filesystem","shell"]`,
+so over a remote session they go through the same `ensurePermission` prompt as
+the shell bridge. All spawning/parsing lives inside each module — the gateway
+only ever sees the `Bridge` interface.
+
+The Gemini bridge's **stdin fallback** is the one extra wrinkle: if `gemini -p`
+exits non-zero with no stdout (some versions only read the prompt from stdin in
+non-TTY contexts), it retries once by piping the prompt on stdin. Both paths are
+contained in `gemini-cli.ts`.
 
 ## Capability scanning + wrapper generation
 

@@ -13,6 +13,9 @@
 
 import { ShellBridge } from "./shell.js";
 import { AiderBridge } from "./aider.js";
+import { ClaudeCodeBridge } from "./claude-code.js";
+import { GeminiCliBridge } from "./gemini-cli.js";
+import { OpenCodeBridge } from "./opencode.js";
 import {
   type Bridge,
   type BridgeStatus,
@@ -24,6 +27,12 @@ import {
 const BRIDGES: Record<string, Bridge> = {
   shell: new ShellBridge(),
   aider: new AiderBridge(),
+  // External AI-CLI bridges. Each proxies to the user's locally-installed CLI
+  // (its own auth/subscription — no SkillOS API key needed) and degrades
+  // gracefully when the binary is missing.
+  "claude-code": new ClaudeCodeBridge(),
+  gemini: new GeminiCliBridge(),
+  opencode: new OpenCodeBridge(),
 };
 
 /** Bridges the user has run `/connect` on this process (name → bridge). */
