@@ -1,14 +1,21 @@
 /**
- * Bridge registry (Layer 5).
+ * Bridge registry (Layer 5) + catalog-driven CLI detection (Feature B).
  *
  * Holds the set of known bridges, tracks which are "connected" (have run
  * `connect()` this process), and generates the internal wrapper map so a bridge
  * command is runnable via `/run <wrapped>`. This keeps index.ts thin and keeps
  * all bridge bookkeeping in one auditable place.
  *
- * Adding a bridge: implement `Bridge` in its own module and add one entry to
- * `BRIDGES` below. Nothing else changes — `/connect`, `/bridges`, and `/run`
- * proxying all work generically off the interface.
+ * TWO sources of CLI bridges now:
+ *   1. TUNED modules (shell, aider, claude-code, gemini, opencode, kilo-code) —
+ *      hand-written for richer behavior. Registered directly below.
+ *   2. The CLI CATALOG (catalog.ts) — every entry WITHOUT a tuned module gets a
+ *      GenericCliBridge built from its metadata. So the system surfaces ANY
+ *      installed AI CLI it knows about, not just a fixed four.
+ *
+ * Detection: the unified picker uses a FAST PATH SCAN (detect.ts) over the whole
+ * catalog — instant, no `<bin> --version` cold-starts. The tuned bridges keep
+ * their own richer `--version` probe when actually connected.
  */
 
 import { ShellBridge } from "./shell.js";
@@ -17,6 +24,9 @@ import { ClaudeCodeBridge } from "./claude-code.js";
 import { GeminiCliBridge } from "./gemini-cli.js";
 import { OpenCodeBridge } from "./opencode.js";
 import { KiloCodeBridge } from "./kilo-code.js";
+import { GenericCliBridge } from "./generic-cli.js";
+import { CLI_CATALOG, catalogEntry, type CliCatalogEntry } from "./catalog.js";
+import { isBinaryOnPath } from "./detect.js";
 import {
   type Bridge,
   type BridgeStatus,
@@ -24,37 +34,51 @@ import {
   toolsForCommand,
 } from "./types.js";
 
-/** Every bridge SkillOS knows how to connect, keyed by `/connect <target>`. */
+/**
+ * Every bridge SkillOS knows how to connect, keyed by `/connect <target>`. The
+ * tuned modules are registered explicitly; the catalog adds a GenericCliBridge
+ * for each entry that lacks a tuned module (so `/connect codex`, `/run qwen-ask`,
+ * etc. all work generically).
+ */
 const BRIDGES: Record<string, Bridge> = {
   shell: new ShellBridge(),
   aider: new AiderBridge(),
-  // External AI-CLI bridges. Each proxies to the user's locally-installed CLI
-  // (its own auth/subscription — no SkillOS API key needed) and degrades
-  // gracefully when the binary is missing. These doubles as selectable ACTIVE
-  // providers (see providers/provider.ts) so the core loop can stream through
-  // them, not just /connect+/run.
+  // External AI-CLI bridges (tuned). Each proxies to the user's locally-installed
+  // CLI (its own auth/subscription — no SkillOS API key) and degrades gracefully
+  // when the binary is missing. These double as selectable ACTIVE providers (see
+  // providers/provider.ts) so the core loop can stream through them.
   "claude-code": new ClaudeCodeBridge(),
   gemini: new GeminiCliBridge(),
   opencode: new OpenCodeBridge(),
   "kilo-code": new KiloCodeBridge(),
 };
 
+// Add a GenericCliBridge for every catalog entry WITHOUT a tuned module. (Tuned
+// entries are already registered above; we don't overwrite them.)
+for (const entry of CLI_CATALOG) {
+  if (!entry.tuned && !BRIDGES[entry.id]) {
+    BRIDGES[entry.id] = new GenericCliBridge(entry);
+  }
+}
+
 /**
- * The bridge ids that are ALSO selectable as the active LLM provider (their
- * `ask` capability is proxied by `streamCompletion`). Order is the picker order.
+ * The CLI ids that are ALSO selectable as the active LLM provider (their `ask`
+ * capability is proxied by `streamCompletion`). This is now the WHOLE catalog,
+ * in catalog order — every known AI CLI can be the active provider when installed.
  */
-export const CLI_PROVIDER_BRIDGES = [
-  "claude-code",
-  "gemini",
-  "opencode",
-  "kilo-code",
-] as const;
+export const CLI_PROVIDER_BRIDGES = CLI_CATALOG.map((e) => e.id) as string[];
 
-export type CliProviderId = (typeof CLI_PROVIDER_BRIDGES)[number];
+/** A CLI provider id is any catalog id (a plain string at the type level). */
+export type CliProviderId = string;
 
-/** True if a string names a CLI-backed provider bridge. */
+/** True if a string names a CLI-backed provider (i.e. a catalog id). */
 export function isCliProviderId(id: string): id is CliProviderId {
-  return (CLI_PROVIDER_BRIDGES as readonly string[]).includes(id);
+  return catalogEntry(id) !== undefined;
+}
+
+/** The catalog entry for a CLI provider id (or undefined). */
+export function cliCatalogEntry(id: string): CliCatalogEntry | undefined {
+  return catalogEntry(id);
 }
 
 /** Get a bridge by its target id (without connecting it). */
@@ -155,51 +179,39 @@ export function resolveWrapper(name: string): BridgeWrapper | null {
 
 /**
  * Process-wide cache of which CLI provider bridges are installed. Populated once
- * at startup (`detectCliProviders`) so the `/provider` picker never has to spawn
- * `<bin> --version` per render (gemini cold-start alone is ~6s). New installs
- * require a server restart to appear — acceptable and noted in the picker.
+ * at startup (`detectCliProviders`) by a FAST PATH SCAN (no `<bin> --version`
+ * cold-starts — gemini alone is ~6s). New installs require a server restart to
+ * appear — acceptable and noted in the picker.
  */
-const cliInstalled = new Map<CliProviderId, boolean>();
+const cliInstalled = new Map<string, boolean>();
 
 /**
- * Detect every CLI provider bridge in PARALLEL with a short timeout and cache
- * the results for the process. Returns the installed map. Never throws — a
- * detection failure simply records `false`. Call once at server startup.
+ * Detect every catalog CLI by PATH scan and cache the result for the process.
+ * Returns the installed map. Never throws — a detection failure records `false`.
+ * Call once at server startup. This is INSTANT (no child processes), so the old
+ * per-bridge `--version` spawning at startup is gone.
+ *
+ * Note: the parameter is kept for source compatibility with the prior signature
+ * but is unused — the PATH scan needs no timeout.
  */
 export async function detectCliProviders(
-  timeoutMs = 8000,
-): Promise<Map<CliProviderId, boolean>> {
-  await Promise.all(
-    CLI_PROVIDER_BRIDGES.map(async (id) => {
-      const bridge = BRIDGES[id];
-      let installed = false;
-      if (bridge) {
-        try {
-          // connect() runs the bridge's own (never-throwing) detection and sets
-          // status; we read it back. The per-bridge detection has its own
-          // generous internal timeout, but we cap the whole call here too so a
-          // stuck binary can't delay startup.
-          const status = await withTimeout(bridge.connect(), timeoutMs, "error");
-          installed = status === "ready";
-        } catch {
-          installed = false;
-        }
-      }
-      cliInstalled.set(id, installed);
-    }),
-  );
+  _timeoutMs = 8000,
+): Promise<Map<string, boolean>> {
+  for (const entry of CLI_CATALOG) {
+    cliInstalled.set(entry.id, isBinaryOnPath(entry.binCandidates));
+  }
   return cliInstalled;
 }
 
 /** Whether a CLI provider bridge was detected as installed at startup. */
-export function isCliInstalled(id: CliProviderId): boolean {
+export function isCliInstalled(id: string): boolean {
   return cliInstalled.get(id) ?? false;
 }
 
 /** A snapshot of the cached install map (for diagnostics / the picker). */
-export function cliInstallSnapshot(): Record<CliProviderId, boolean> {
-  const out = {} as Record<CliProviderId, boolean>;
-  for (const id of CLI_PROVIDER_BRIDGES) out[id] = isCliInstalled(id);
+export function cliInstallSnapshot(): Record<string, boolean> {
+  const out: Record<string, boolean> = {};
+  for (const entry of CLI_CATALOG) out[entry.id] = isCliInstalled(entry.id);
   return out;
 }
 
@@ -246,7 +258,7 @@ export interface CliAskResult {
  * `/connect` first — selecting the CLI as the active provider is enough).
  */
 export async function runCliAsk(
-  id: CliProviderId,
+  id: string,
   prompt: string,
   onText: (text: string) => void,
   timeoutMs = 120000,

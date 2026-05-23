@@ -171,6 +171,51 @@ export async function recentMessages(userId: string, take = 20) {
   return rows.reverse();
 }
 
+// ---------------------------------------------------------------------------
+// Per-task model routing (Feature A) — the RoutingPreference table.
+//
+// A "route" pins a SELECTOR to a TARGET. The selector is a category
+// (coding/writing/…), a skill name, or "default"; the target is a logical model
+// name (claude/gpt/…), a cross-provider pin "<provider>:<model>"
+// (e.g. anthropic:claude-3-5-sonnet-latest, cli:gemini), or "auto"/"clear" to
+// remove. We reuse the existing RoutingPreference columns as-is: `selector`
+// holds the bare selector string and `model` holds the target string. The
+// table's @@unique([userId, selector]) makes set/clear a clean upsert/delete.
+// ---------------------------------------------------------------------------
+
+/** All of a user's persisted routes as a { selector: target } map. */
+export async function getRoutes(
+  userId: string,
+): Promise<Record<string, string>> {
+  const rows = await getDb().routingPreference.findMany({ where: { userId } });
+  const out: Record<string, string> = {};
+  for (const r of rows) out[r.selector] = r.model;
+  return out;
+}
+
+/** Set (or replace) a route: persist selector → target for this user. */
+export async function setRoute(
+  userId: string,
+  selector: string,
+  target: string,
+): Promise<void> {
+  await getDb().routingPreference.upsert({
+    where: { userId_selector: { userId, selector } },
+    create: { userId, selector, model: target },
+    update: { model: target },
+  });
+}
+
+/** Remove a route. No-op if the selector wasn't pinned. */
+export async function clearRoute(
+  userId: string,
+  selector: string,
+): Promise<void> {
+  await getDb()
+    .routingPreference.deleteMany({ where: { userId, selector } })
+    .catch(() => {});
+}
+
 /** Record/refresh metadata for a skill on disk (provenance tracking). */
 export async function upsertSkillMeta(meta: {
   name: string;

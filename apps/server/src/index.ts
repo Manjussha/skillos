@@ -5,7 +5,12 @@ import { createServer, type IncomingMessage } from "node:http";
 import { WebSocketServer, WebSocket } from "ws";
 import { parse } from "./parser.js";
 import { loadSkills, skillsDir } from "./skills/engine.js";
-import { routeModel } from "./router/router.js";
+import {
+  resolveRoute,
+  parseRouteTarget,
+  categoryDefaults,
+  ROUTE_CATEGORIES,
+} from "./router/router.js";
 import {
   resolveProvider,
   streamCompletion,
@@ -24,6 +29,9 @@ import {
   saveMessage,
   createSession,
   parseStringList,
+  getRoutes,
+  setRoute,
+  clearRoute,
 } from "./storage/repo.js";
 import {
   newOnboarding,
@@ -128,6 +136,13 @@ interface Session {
   memory: string | null;
   /** Whether this session has produced any persisted messages (drives compress). */
   hadMessages: boolean;
+  /**
+   * Feature A — per-task model routes for this user: { selector: target }.
+   * Loaded from the RoutingPreference table on connect, kept in sync as `/route`
+   * mutates it. Applied in run() (and the agent path) to pick per-task models /
+   * cross-provider pins.
+   */
+  routes: Record<string, string>;
 }
 
 /** Per-user guard so concurrent disconnects don't clobber the memory doc. */
@@ -226,7 +241,16 @@ async function initConnection(
     picker: null,
     memory: null,
     hadMessages: false,
+    routes: {},
   };
+
+  // Feature A: load the user's persisted per-task routes into the session so
+  // run() can apply them this connection (survives restarts via the DB).
+  try {
+    session.routes = await getRoutes(user.id);
+  } catch {
+    session.routes = {};
+  }
 
   // Cross-session memory: recall the user's prior memory doc, if any. Done
   // before greeting so the recall info lands right after "Connected".
@@ -504,6 +528,10 @@ async function handleInput(
         break;
       case "use":
         setModel(ws, session, cmd.args);
+        break;
+      case "route":
+        // Feature A: per-task model routing (set/clear/show). Info-only.
+        await doRoute(ws, session, cmd.args);
         break;
       case "onboarding":
         startOnboarding(ws, session);
@@ -939,6 +967,121 @@ async function advancePicker(
     text: `"${text}" isn't in the list — picker cancelled. Override unchanged (${session.override ?? "auto"}).`,
   });
   return endTurn(ws);
+}
+
+// ---------------------------------------------------------------------------
+// Per-task model routing (Feature A) — /route
+// ---------------------------------------------------------------------------
+
+/** Valid selectors a route can key on: a category, a known skill name, or "default". */
+function isValidSelector(sel: string): boolean {
+  if (sel === "default") return true;
+  if ((ROUTE_CATEGORIES as readonly string[]).includes(sel)) return true;
+  return skills.has(sel);
+}
+
+/**
+ * `/route` — pin a model/provider per task category or skill, persisted so it
+ * survives restarts. Info-only (ends the turn via endTurn).
+ *   /route                       → explain + show current routes + category defaults
+ *   /route <selector> <target>   → set + persist
+ *   /route <selector> auto|clear → remove
+ * A target is a logical model (claude|gpt|gemini|deepseek-coder|default), a
+ * cross-provider pin "<provider>:<model>" (e.g. anthropic:claude-3-5-sonnet-latest,
+ * openrouter:deepseek/deepseek-chat, cli:gemini), or auto/clear to remove.
+ */
+async function doRoute(
+  ws: WebSocket,
+  session: Session,
+  args: string,
+): Promise<void> {
+  const parts = args.trim().split(/\s+/).filter(Boolean);
+
+  // No args → show how routing works + current routes + live category defaults.
+  if (parts.length === 0) {
+    const defaults = categoryDefaults();
+    const routeLines = Object.entries(session.routes);
+    const lines = [
+      "Per-task model routing (/route): pin a model or provider per task so each",
+      "capability uses its best backend. Routes persist across restarts.",
+      "",
+      "Resolution per turn: /use override → route for the skill → route for its",
+      "category → skill.bestModel → category rule → default.",
+      "",
+      "Usage:",
+      "  /route <selector> <target>   set a route (persisted)",
+      "  /route <selector> auto       clear a route",
+      "  selector: a category (coding|writing|marketing|ui|reasoning|business),",
+      "            a skill name, or 'default'",
+      "  target:   a logical model (claude|gpt|gemini|deepseek-coder|default),",
+      "            a cross-provider pin <provider>:<model>",
+      "            (e.g. anthropic:claude-3-5-sonnet-latest, cli:gemini), or auto",
+      "",
+      "Your current routes:",
+      ...(routeLines.length
+        ? routeLines.map(([s, t]) => `  ${s} → ${t}`)
+        : ["  (none — using the defaults below)"]),
+      "",
+      "Live category → model defaults:",
+      ...ROUTE_CATEGORIES.map((c) => `  ${c} → ${defaults[c]}`),
+    ];
+    send(ws, { type: "info", text: lines.join("\n") });
+    return;
+  }
+
+  if (parts.length < 2) {
+    send(ws, {
+      type: "error",
+      text:
+        "Usage: /route <selector> <target>  (or /route <selector> auto to clear). " +
+        "Run /route with no args for help.",
+    });
+    return;
+  }
+
+  const selector = (parts[0] ?? "").toLowerCase();
+  const target = parts.slice(1).join(" ").trim();
+
+  if (!isValidSelector(selector)) {
+    send(ws, {
+      type: "error",
+      text:
+        `Unknown selector "${selector}". Use a category ` +
+        `(${ROUTE_CATEGORIES.join("|")}), a skill name, or 'default'.`,
+    });
+    return;
+  }
+
+  // Clear the route.
+  if (target.toLowerCase() === "auto" || target.toLowerCase() === "clear") {
+    delete session.routes[selector];
+    try {
+      await clearRoute(session.userId, selector);
+    } catch {
+      /* persistence is best-effort; the in-session map is already updated */
+    }
+    send(ws, {
+      type: "info",
+      text: `Route cleared for "${selector}" — it now uses default routing.`,
+    });
+    return;
+  }
+
+  // Set + persist the route.
+  session.routes[selector] = target;
+  try {
+    await setRoute(session.userId, selector, target);
+  } catch {
+    /* best-effort persistence */
+  }
+  const { pin } = parseRouteTarget(target);
+  const detail = pin
+    ? `pinned to ${pin.provider} model "${pin.model}" (overrides the active provider for these turns)`
+    : `logical model "${target}" (resolved by the active provider)`;
+  send(ws, {
+    type: "info",
+    text: `Route set: ${selector} → ${target}\n  ${detail}\n  (persisted — survives restarts).`,
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -1410,17 +1553,25 @@ async function run(
   skill: Skill | null,
   content: string,
 ): Promise<void> {
-  const model = routeModel(skill, session.override);
-  const res = resolveProvider(model, session.mode);
+  // Feature A: per-task routing. Effective target = /use override → route for
+  // the skill → route for its category → skill.bestModel → category rule →
+  // default. A cross-provider pin forces THAT provider+model for the turn.
+  const target = resolveRoute(skill, session.override, session.routes);
+  const model = target.model;
+  const res = resolveProvider(model, session.mode, target.pin);
   // Prepend a bounded memory preamble so the model "remembers" prior sessions,
   // without letting it dwarf the actual system prompt.
   const baseSystem = skill?.prompt || DEFAULT_SYSTEM;
   const system = withMemory(session, baseSystem);
   session.hadMessages = true;
 
+  const routeNote =
+    target.source === "route:skill" || target.source === "route:category"
+      ? ` · route: ${target.source.replace("route:", "")}`
+      : "";
   send(ws, {
     type: "info",
-    text: `→ skill: ${skill?.name ?? "(none)"} · model: ${model} · provider: ${res.provider}`,
+    text: `→ skill: ${skill?.name ?? "(none)"} · model: ${model} · provider: ${res.provider}${routeNote}`,
   });
 
   // Persist the user turn (best-effort; never block the model on a DB error).
@@ -1471,6 +1622,9 @@ function sendHelp(ws: WebSocket): void {
       "  /skills                list available skills (active ones marked *)",
       "  /models                pick the active model interactively (or /use <model>)",
       "  /use <model>           force a model (e.g. /use claude); /use auto to clear",
+      "  /route                 show per-task routing + current routes & defaults",
+      "  /route <selector> <t>  pin a model/provider per task (e.g. /route coding deepseek-coder",
+      "                         or /route ui cli:gemini); /route <selector> auto to clear",
       "  /provider              switch provider / connect an API key (local only)",
       "  /onboarding            (re)run first-run personalization",
       "  /profile               show your saved profile",

@@ -9,6 +9,7 @@ import {
   isCliProviderId,
   isCliInstalled,
   runCliAsk,
+  cliCatalogEntry,
   type CliProviderId,
 } from "../bridges/registry.js";
 
@@ -335,18 +336,54 @@ function openrouterSlug(logical: Logical, mode: RouteMode): string {
 }
 
 /**
+ * A per-call provider PIN (Feature A — per-task routing). When present it FORCES
+ * a specific backend for this turn, overriding the globally-active provider:
+ *   - `provider: "cli"` + `model: "<cliId>"` → route the turn through that
+ *     installed CLI bridge (its own auth);
+ *   - `provider: <registry kind>` (openai/anthropic/…/openrouter/ollama/
+ *     ollama-cloud) + `model: <concrete model id>` → that provider + model.
+ * Parsed from a route target "<provider>:<model>" in router.ts.
+ */
+export interface ProviderPin {
+  provider: string;
+  model: string;
+}
+
+/**
  * Pick a concrete provider + model. The provider is whatever's active; the model
  * is derived from `logical`, which may be:
  *   - a logical name (claude/gpt/gemini/deepseek-coder/default) → mapped per
  *     provider (OpenRouter also honors `mode` tiers); or
  *   - a concrete model id for the active provider (e.g. via `/models`/`/use`) →
  *     used as-is.
- * The signature is unchanged so all callers keep working.
+ *
+ * Feature A: when `pin` is supplied it OVERRIDES the active provider for this
+ * call (cross-provider per-task routing). The signature stays
+ * backward-compatible (existing 2-arg callers are unchanged).
  */
 export function resolveProvider(
   logical: string,
   mode: RouteMode = "best",
+  pin?: ProviderPin | null,
 ): Resolution {
+  // A cross-provider pin forces a specific backend for this turn, regardless of
+  // the active provider or `local` mode. CLI pins route through the bridge.
+  if (pin) {
+    const prov = pin.provider.toLowerCase();
+    if (prov === "cli") {
+      const id = pin.model;
+      if (isCliProviderId(id)) {
+        return { kind: "cli", model: id, provider: `cli:${id}`, cliId: id };
+      }
+      // Unknown CLI id pinned — fall through to normal resolution below.
+    } else if ((PROVIDER_REGISTRY as Record<string, ProviderDef>)[prov]) {
+      // A registry provider pinned to a concrete model id — use as-is.
+      const kind = prov as RegistryKind;
+      return { kind, model: pin.model, provider: `${kind}:${pin.model}` };
+    }
+    // Unrecognized provider in the pin — ignore it and resolve normally.
+  }
+
   // `local` mode still prefers on-device Ollama when configured, regardless of
   // the active provider — privacy override, matching prior behavior.
   if (mode === "local" && process.env.OLLAMA_BASE_URL) {
@@ -457,29 +494,41 @@ export function providerInfo(): ProviderInfo[] {
     group: "local",
   });
 
-  // 3) Installed CLI tools (use their own login — no SkillOS key).
-  for (const id of CLI_PROVIDER_BRIDGES) {
+  // 3) Installed CLI tools (use their own login — no SkillOS key). The four
+  //    "core" CLIs are ALWAYS listed (continuity + selectable even before a
+  //    restart re-detects them); every OTHER catalog CLI is listed only when
+  //    detected installed (Feature B — surface ANY installed AI CLI). `aider` is
+  //    catalog-known but stays a bridge-only editing tool, not a chat provider,
+  //    so it's excluded here.
+  const CORE_CLI: string[] = ["claude-code", "gemini", "opencode", "kilo-code"];
+  const shownCli = new Set<string>();
+  const pushCli = (id: string) => {
+    if (shownCli.has(id)) return;
+    shownCli.add(id);
     out.push({
       id,
-      label: CLI_LABELS[id],
+      label: cliLabel(id),
       needsKey: false,
       hasKey: false,
       active: sel === id,
       group: "cli",
       installed: isCliInstalled(id),
     });
+  };
+  for (const id of CORE_CLI) pushCli(id);
+  for (const id of CLI_PROVIDER_BRIDGES) {
+    if (id === "aider") continue;
+    if (CORE_CLI.includes(id)) continue;
+    if (isCliInstalled(id)) pushCli(id);
   }
 
   return out;
 }
 
-/** Human labels for the CLI provider options in the picker. */
-const CLI_LABELS: Record<CliProviderId, string> = {
-  "claude-code": "Claude Code",
-  gemini: "Gemini",
-  opencode: "OpenCode",
-  "kilo-code": "Kilo Code",
-};
+/** Human label for a CLI provider option (from the catalog, with a fallback). */
+function cliLabel(id: string): string {
+  return cliCatalogEntry(id)?.label ?? id;
+}
 
 /**
  * The selectable model ids for a provider (defaults to the active provider).

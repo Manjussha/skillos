@@ -154,11 +154,13 @@ clearEnv();
   check("providerInfo active is anthropic", active?.id === "anthropic", active?.id);
   check("providerInfo anthropic.hasKey true", anth?.hasKey === true);
   // Unified picker: 6 API providers + 2 local/hosted (ollama, ollama-cloud) +
-  // 4 installed-CLI options (claude-code, gemini, opencode, kilo-code) = 12.
-  // mock is intentionally NOT listed (offered as a separate "Skip" option).
+  // the 4 CORE CLI options (claude-code, gemini, opencode, kilo-code) — and now,
+  // with the Feature B catalog, ANY OTHER installed AI CLI (codex, qwen, …) is
+  // ALSO listed, so the count is >= 12 (exactly 12 when no extra catalog CLIs
+  // are installed). mock is intentionally NOT listed (separate "Skip" option).
   check(
-    "providerInfo lists 12 unified options (api+local+cli)",
-    info.length === 12,
+    "providerInfo lists >= 12 unified options (api+local+cli, +installed catalog CLIs)",
+    info.length >= 12,
     String(info.length),
   );
   const cloud = info.find((p) => p.id === "ollama-cloud");
