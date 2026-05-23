@@ -4,14 +4,11 @@ import { WebSocket } from "ws";
 /**
  * SkillOS native terminal client.
  *
- * A thin CLI over the same WebSocket protocol the browser terminal uses, so you
- * can drive SkillOS directly from your shell. It renders EVERY server message
- * type (info / chunk / error / done / stage / qr / permission-request) and sends
- * every client message (input / auth / permission-response).
- *
- * On a real terminal (TTY) it shows a live, navigable slash-command menu: type
- * "/", filter as you go, ↑/↓ to move, Tab to fill, Enter to run, Esc to dismiss.
- * When piped / non-interactive it falls back to plain line input.
+ * A thin CLI over the same WebSocket protocol the browser terminal uses. On a
+ * real terminal (TTY) it renders a Claude-Code-style bordered input box with a
+ * live, navigable slash-command menu (type "/", ↑/↓ to move, Tab to fill, Enter
+ * to run, Esc to dismiss). When piped / non-interactive it falls back to plain
+ * line input. It renders every server message type and sends every client one.
  *
  * Usage:
  *   npm run cli                       # connect to ws://localhost:8787
@@ -46,8 +43,6 @@ const C = {
   cyan: "\x1b[1;36m",
   yellow: "\x1b[33m",
 };
-const PROMPT = `${C.green}skillos>${C.reset} `;
-const PROMPT_LEN = "skillos> ".length; // visible width (no ANSI)
 
 /** Slash commands offered in the autocomplete menu (client-side mirror). */
 const COMMANDS: [string, string][] = [
@@ -64,16 +59,16 @@ const COMMANDS: [string, string][] = [
   ["/build-dashboard", "workflow: plan → code → review"],
   ["/build-api", "workflow: plan → code → review"],
   ["/remote", "remote access: /remote start|status|stop"],
-  ["/connect", "connect a bridge: /connect shell|aider"],
+  ["/connect", "connect a bridge: /connect shell|aider|gemini|…"],
   ["/bridges", "list connected bridges"],
   ["/run", "run a skill or bridge command"],
   ["/exit", "quit the CLI"],
 ];
 
 // ---- Shared turn state ----------------------------------------------------
-let busy = false; // a turn is in flight; suppress input + the prompt
-let pendingNewline = false; // a banner printed; break before streamed chunks
-let pendingPermission: string | null = null; // id of an awaiting permission prompt
+let busy = false;
+let pendingNewline = false;
+let pendingPermission: string | null = null;
 let stdinClosed = false;
 
 const out = (s: string): void => void process.stdout.write(s);
@@ -154,7 +149,7 @@ function submit(text: string): void {
     ws.send(JSON.stringify({ type: "permission-response", id: pendingPermission, approved }));
     pendingPermission = null;
     busy = true;
-    ui.beginTurn();
+    ui.beginTurn(t);
     return;
   }
   if (busy) return;
@@ -169,7 +164,7 @@ function submit(text: string): void {
   }
   busy = true;
   pendingNewline = false;
-  ui.beginTurn();
+  ui.beginTurn(t);
   ws.send(JSON.stringify({ type: "input", text: t }));
 }
 
@@ -187,25 +182,28 @@ function endTurn(): void {
 
 // ---- UI abstraction -------------------------------------------------------
 interface UI {
-  message(text: string, color?: string): void; // print a discrete server message
-  rearm(): void; // turn ended / idle — show a fresh prompt
-  beginTurn(): void; // user submitted — clear the input region for output
+  message(text: string, color?: string): void;
+  rearm(): void;
+  beginTurn(echo: string): void;
   stop(): void;
 }
 
 const isTTY = Boolean(process.stdin.isTTY);
 const ui: UI = isTTY ? createInteractiveUI() : createLineUI();
 
-// ---- Interactive UI (raw mode + slash-command menu) -----------------------
+// ---- Interactive UI (raw mode, bordered input box + slash menu) -----------
 function createInteractiveUI(): UI {
-  let line = ""; // current input (cursor is always at end)
+  let line = "";
   let menuOpen = false;
   let items: [string, string][] = [];
   let sel = 0;
-  let promptShown = false;
+  let shown = false; // a box is currently drawn; cursor rests on its content line
+
+  const boxWidth = (): number =>
+    Math.max(40, Math.min(process.stdout.columns || 80, 100));
 
   const refreshMenu = (): void => {
-    const m = /^\/(\S*)$/.exec(line); // "/", "/sk" … but not after a space
+    const m = /^\/(\S*)$/.exec(line);
     if (m) {
       const p = (m[1] ?? "").toLowerCase();
       items = COMMANDS.filter(([n]) => n.slice(1).startsWith(p)).slice(0, 8);
@@ -217,35 +215,55 @@ function createInteractiveUI(): UI {
     }
   };
 
+  /** Draw the input box (and menu); leaves the cursor inside the box. */
   const render = (): void => {
-    let s = "\r\x1b[J" + PROMPT + line; // clear region, draw prompt + line
+    const W = boxWidth();
+    const inner = W - 4; // between "│ " and " │"
+    const text = "> " + line;
+    const vis = text.length > inner ? text.slice(text.length - inner) : text;
+    const pad = " ".repeat(Math.max(0, inner - vis.length));
+    const body =
+      text.length > inner ? vis : `${C.green}> ${C.reset}${line}`;
+    const top = `${C.dim}╭${"─".repeat(W - 2)}╮${C.reset}`;
+    const mid = `${C.dim}│${C.reset} ${body}${pad} ${C.dim}│${C.reset}`;
+    const bot = `${C.dim}╰${"─".repeat(W - 2)}╯${C.reset}`;
+
+    let s = shown ? "\x1b[1A\r\x1b[J" : "\r\x1b[J"; // clear old box region
+    s += `${top}\n${mid}\n${bot}`;
+    let below = 1; // bottom border sits below the content line
     if (menuOpen) {
       for (let i = 0; i < items.length; i++) {
-        const [name, desc] = items[i]!;
+        const [n, d] = items[i]!;
         s +=
-          i === sel
-            ? `\n${C.cyan}› ${name}${C.reset}  ${C.dim}${desc}${C.reset}`
-            : `\n  ${name}  ${C.dim}${desc}${C.reset}`;
+          "\n" +
+          (i === sel
+            ? `${C.cyan}› ${n}${C.reset}  ${C.dim}${d}${C.reset}`
+            : `  ${n}  ${C.dim}${d}${C.reset}`);
+        below++;
       }
       s += `\n${C.dim}  ↑↓ navigate · Tab fill · Enter run · Esc dismiss${C.reset}`;
-      s += `\x1b[${items.length + 1}A`; // move back up to the prompt line
+      below++;
     }
-    const col = PROMPT_LEN + line.length;
-    s += "\r" + (col > 0 ? `\x1b[${col}C` : "");
+    s += `\x1b[${below}A\r`; // back up to the content line, column 0
+    const col = 2 + vis.length; // after "│ " + visible text
+    if (col > 0) s += `\x1b[${col}C`;
     out(s);
-    promptShown = true;
+    shown = true;
   };
 
+  /** Erase the box region so server output can be printed cleanly above it. */
   const clearRegion = (): void => {
-    if (promptShown) out("\r\x1b[J");
-    promptShown = false;
+    if (shown) {
+      out("\x1b[1A\r\x1b[J");
+      shown = false;
+    }
   };
 
   const accept = (withSpace: boolean): void => {
     const picked = items[sel];
     if (!picked) return;
     line = picked[0] + (withSpace ? " " : "");
-    refreshMenu(); // a trailing space closes the menu
+    refreshMenu();
     render();
   };
 
@@ -255,16 +273,21 @@ function createInteractiveUI(): UI {
       ws.close();
       process.exit(0);
     }
-    if (busy) return; // ignore input mid-turn
+    if (busy) return;
 
     switch (key.name) {
       case "return":
-      case "enter":
-        if (menuOpen) accept(false); // fill the highlighted command…
-        clearRegion();
-        submit(line); // …then run it
+      case "enter": {
+        if (menuOpen) {
+          const p = items[sel];
+          if (p) line = p[0];
+          menuOpen = false;
+        }
+        const text = line;
         line = "";
+        submit(text); // beginTurn() clears the box + echoes
         return;
+      }
       case "tab":
         if (menuOpen) accept(true);
         else {
@@ -296,7 +319,6 @@ function createInteractiveUI(): UI {
         }
         return;
     }
-    // Printable input (incl. paste): insert any non-control characters.
     if (str && !key.ctrl && !key.meta) {
       const printable = [...str].filter((ch) => ch >= " ").join("");
       if (printable) {
@@ -318,7 +340,7 @@ function createInteractiveUI(): UI {
         out(`\n${color}${text}${C.reset}`);
       } else {
         clearRegion();
-        out(`${color}${text.replace(/\n/g, "\n")}${C.reset}\n`);
+        out(`${color}${text}${C.reset}\n`);
         render();
       }
     },
@@ -327,10 +349,9 @@ function createInteractiveUI(): UI {
       menuOpen = false;
       render();
     },
-    beginTurn() {
-      // Echo the submitted line into the scrollback, then clear for output.
+    beginTurn(echo) {
       clearRegion();
-      out(`${PROMPT}${line}\n`);
+      out(`${C.green}>${C.reset} ${echo}\n`); // echo into scrollback
       menuOpen = false;
     },
     stop() {
@@ -344,8 +365,9 @@ function createInteractiveUI(): UI {
   };
 }
 
-// ---- Line UI (non-TTY fallback: piped input, no menu) ---------------------
+// ---- Line UI (non-TTY fallback: piped input, no box/menu) -----------------
 function createLineUI(): UI {
+  const PROMPT = `${C.green}skillos>${C.reset} `;
   const rl = readline.createInterface({
     input: process.stdin,
     output: process.stdout,
