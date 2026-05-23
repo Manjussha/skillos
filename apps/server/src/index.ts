@@ -16,6 +16,7 @@ import {
   streamCompletion,
   providerInfo,
   modelsFor,
+  liveModels,
   activeProvider,
   activeSelection,
   type RouteMode,
@@ -131,7 +132,7 @@ interface Session {
     | null
     | { kind: "provider" }
     | { kind: "apiKey"; provider: string }
-    | { kind: "model" };
+    | { kind: "model"; models?: string[] };
   /** Recalled cross-session memory for this user (null if none). */
   memory: string | null;
   /** Whether this session has produced any persisted messages (drives compress). */
@@ -520,7 +521,7 @@ async function handleInput(
         break;
       case "models":
         // Feature A: now an interactive picker (selection happens next input).
-        startModelPicker(ws, session);
+        await startModelPicker(ws, session);
         break;
       case "provider":
         // Feature A: runtime provider/key switch (local only — writes .env).
@@ -794,22 +795,40 @@ function startProviderPicker(ws: WebSocket, session: Session): void {
  * modelsFor(active) with the current override marked, sets the picker, and ends
  * the turn.
  */
-function startModelPicker(ws: WebSocket, session: Session): void {
+async function startModelPicker(ws: WebSocket, session: Session): Promise<void> {
   session.picker = { kind: "model" };
   const active = activeProvider();
-  const models = modelsFor(active);
+  if (active === "cli") {
+    session.picker = null;
+    send(ws, {
+      type: "info",
+      text: "The active provider is a CLI tool — it picks its own model. Use /provider to switch backends, or /route to pin models per task.",
+    });
+    return;
+  }
+  // Fetch the provider's LIVE model list (e.g. all your Ollama Cloud models),
+  // falling back to the curated static list on error/no-key.
+  const { models, live } = await liveModels(active);
+  const MAX = 30;
+  const shown = models.slice(0, MAX);
+  session.picker = { kind: "model", models: shown }; // remember the shown order
   const current = session.override ?? "auto";
-  const lines = models.map((m, i) => {
+  const lines = shown.map((m, i) => {
     const mark = m === session.override ? " *" : "";
     return `  ${i + 1}) ${m}${mark}`;
   });
+  const note = live ? "live from provider" : "built-in list (no key / offline)";
+  const more =
+    models.length > MAX
+      ? `\n  …and ${models.length - MAX} more — use /use <model-id> to pick any.`
+      : "";
   send(ws, {
     type: "info",
     text: [
-      `Active provider: ${active}. Current model: ${current} (* = active override).`,
+      `Active provider: ${active} · models: ${note}. Current: ${current} (* = override).`,
       "Pick a model by number (or 0 / 'auto' to clear; /command to cancel):",
       ...lines,
-    ].join("\n"),
+    ].join("\n") + more,
   });
 }
 
@@ -935,8 +954,9 @@ async function advancePicker(
     return endTurn(ws);
   }
 
-  // Model picker — choose a concrete model of the active provider.
-  const models = modelsFor(activeProvider());
+  // Model picker — choose a concrete model of the active provider. Use the list
+  // we actually showed (the live-fetched, capped list), falling back to static.
+  const models = picker.models ?? modelsFor(activeProvider());
   const choice = text.toLowerCase();
   if (choice === "0" || choice === "auto") {
     session.override = null;

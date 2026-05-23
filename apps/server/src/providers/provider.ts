@@ -541,6 +541,81 @@ export function modelsFor(providerId?: ProviderKind | RegistryKind): string[] {
   return PROVIDER_REGISTRY[id as RegistryKind].models;
 }
 
+/**
+ * Fetch the provider's LIVE model list (so `/models` shows what your account
+ * actually has, e.g. all your Ollama Cloud models — not just the curated few).
+ * OpenAI-compatible providers expose `/models`; local Ollama exposes `/tags`.
+ * Returns `{ models, live }` — `live: false` means we fell back to the static
+ * registry list (no key, network/endpoint error, or unsupported provider).
+ */
+export async function liveModels(
+  providerId?: ProviderKind | RegistryKind,
+): Promise<{ models: string[]; live: boolean }> {
+  const id = providerId ?? activeProvider();
+  if (id === "cli") return { models: [], live: false };
+  const fallback = PROVIDER_REGISTRY[id as RegistryKind].models;
+  try {
+    const fetched = await fetchModelList(id as RegistryKind);
+    if (fetched && fetched.length) return { models: fetched, live: true };
+  } catch {
+    /* fall through to the static list */
+  }
+  return { models: fallback, live: false };
+}
+
+async function fetchModelList(kind: RegistryKind): Promise<string[] | null> {
+  switch (kind) {
+    case "ollama-cloud":
+      return fetchOpenAIModels(
+        process.env.OLLAMA_CLOUD_URL ?? "https://ollama.com/v1",
+        process.env.OLLAMA_API_KEY,
+      );
+    case "openrouter":
+      return fetchOpenAIModels("https://openrouter.ai/api/v1", process.env.OPENROUTER_API_KEY);
+    case "openai":
+      return fetchOpenAIModels("https://api.openai.com/v1", process.env.OPENAI_API_KEY);
+    case "groq":
+      return fetchOpenAIModels("https://api.groq.com/openai/v1", process.env.GROQ_API_KEY);
+    case "deepseek":
+      return fetchOpenAIModels("https://api.deepseek.com", process.env.DEEPSEEK_API_KEY);
+    case "ollama":
+      return fetchOllamaTags(process.env.OLLAMA_BASE_URL ?? "http://localhost:11434/api");
+    default:
+      return null; // anthropic / google / mock → use the static list
+  }
+}
+
+/** GET <baseURL>/models (OpenAI-compatible) → list of model ids. */
+async function fetchOpenAIModels(baseURL: string, key?: string): Promise<string[] | null> {
+  const url = baseURL.replace(/\/$/, "") + "/models";
+  const resp = await withTimeout(
+    fetch(url, { headers: key ? { Authorization: `Bearer ${key}` } : {} }),
+  );
+  if (!resp.ok) return null;
+  const json = (await resp.json()) as { data?: { id?: string }[] };
+  const ids = (json.data ?? []).map((m) => m.id).filter((x): x is string => !!x);
+  return ids.length ? ids : null;
+}
+
+/** GET <base>/tags (Ollama native) → list of installed model names. */
+async function fetchOllamaTags(base: string): Promise<string[] | null> {
+  const url = base.replace(/\/$/, "") + "/tags";
+  const resp = await withTimeout(fetch(url));
+  if (!resp.ok) return null;
+  const json = (await resp.json()) as { models?: { name?: string }[] };
+  const names = (json.models ?? []).map((m) => m.name).filter((x): x is string => !!x);
+  return names.length ? names : null;
+}
+
+/** Reject a model-list fetch that hangs, so the `/models` picker stays responsive. */
+function withTimeout(p: Promise<Response>, ms = 8000): Promise<Response> {
+  let timer: ReturnType<typeof setTimeout>;
+  const timeout = new Promise<Response>((_, rej) => {
+    timer = setTimeout(() => rej(new Error("model-list fetch timed out")), ms);
+  });
+  return Promise.race([p, timeout]).finally(() => clearTimeout(timer));
+}
+
 // ---------------------------------------------------------------------------
 // Streaming
 // ---------------------------------------------------------------------------
