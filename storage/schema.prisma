@@ -1,0 +1,140 @@
+// SkillOS — Layer 2 persistence schema (SQLite + Prisma 7).
+//
+// Prisma 7 no longer keeps the datasource URL in this file. The DB location is
+// configured in apps/server/prisma.config.ts (CLI/migrate) and the runtime
+// PrismaClient connects through a better-sqlite3 driver adapter
+// (apps/server/src/storage/db.ts). Default DB path: storage/skillos.db.
+//
+// Regenerate the client and apply the schema with:
+//   npm run db:generate -w apps/server   # generate the client
+//   npm run db:push     -w apps/server   # create/sync storage/skillos.db
+// See storage/README.md for details.
+
+generator client {
+  // Prisma 7's ESM-native generator. Output lives under the server's src tree
+  // so relative ".js" ESM imports resolve; the folder is gitignored and
+  // excluded from tsc (see apps/server/tsconfig.json).
+  provider     = "prisma-client"
+  output       = "../apps/server/src/generated/prisma"
+  moduleFormat = "esm"
+  runtime      = "nodejs"
+}
+
+datasource db {
+  provider = "sqlite"
+}
+
+/// A SkillOS user. v0.1 is single-user/local-first, so there is normally one
+/// row, but the model is here for multi-user later (Layer 4 remote access).
+model User {
+  id        String   @id @default(cuid())
+  email     String?  @unique
+  createdAt DateTime @default(now())
+
+  profile            Profile?
+  sessions           Session[]
+  messages           Message[]
+  routingPreferences RoutingPreference[]
+}
+
+/// Onboarding answers: what the user does, their stack, and their preferred
+/// routing mode (fast/best/cheapest/local).
+model Profile {
+  id     String @id @default(cuid())
+  userId String @unique
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  /// Primary use-case category, e.g. "coding", "writing", "marketing".
+  userType String
+  /// Free-text description of the business/domain (drives skill generation).
+  useCase String @default("")
+  /// JSON-encoded string[] of stacks, e.g. ["react","node"].
+  stacks String @default("[]")
+  /// Routing mode: "fast" | "best" | "cheapest" | "local".
+  mode String @default("best")
+  /// JSON-encoded string[] of skill names auto-activated for this profile.
+  activeSkills String @default("[]")
+
+  onboardedAt DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
+
+/// Metadata for an installed or generated skill (the Markdown/JSON file under
+/// skills/ is still the source of truth; this row tracks provenance).
+model Skill {
+  id          String   @id @default(cuid())
+  name        String   @unique
+  category    String
+  description String   @default("")
+  bestModel   String   @default("")
+  /// "builtin" | "generated" | "installed".
+  origin String @default("builtin")
+  /// Path of the skill file on disk, relative to the skills/ dir.
+  source    String   @default("")
+  createdAt DateTime @default(now())
+}
+
+/// An installed skill pack (a bundle of related skills).
+model SkillPack {
+  id          String   @id @default(cuid())
+  name        String   @unique
+  description String   @default("")
+  /// JSON-encoded string[] of skill names contained in the pack.
+  skills      String   @default("[]")
+  installedAt DateTime @default(now())
+}
+
+/// A connection/auth session. Used now to namespace conversation history and
+/// the /use override; tokens + scoped permissions become load-bearing in
+/// Layer 4 (remote access).
+model Session {
+  id     String @id @default(cuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  /// Opaque session token (random); reserved for remote auth in Layer 4.
+  token String @unique
+  /// JSON-encoded string[] of granted permissions, e.g. ["shell","filesystem"].
+  permissions String   @default("[]")
+  createdAt   DateTime @default(now())
+  expiresAt   DateTime?
+
+  messages Message[]
+}
+
+/// A user-pinned routing rule: category (or skill name) -> logical model.
+/// Layered on top of the rule-based router; an override the user opts into.
+model RoutingPreference {
+  id     String @id @default(cuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  /// What this rule keys on, e.g. "category:coding" or "skill:seo".
+  selector String
+  /// Logical model name to route to.
+  model     String
+  createdAt DateTime @default(now())
+
+  @@unique([userId, selector])
+}
+
+/// Conversation history: one row per turn (user message or assistant reply).
+model Message {
+  id     String @id @default(cuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  sessionId String?
+  session   Session? @relation(fields: [sessionId], references: [id], onDelete: SetNull)
+
+  /// "user" | "assistant" | "system".
+  role    String
+  content String
+  /// Logical model used for an assistant turn (null for user turns).
+  model String?
+  /// Skill applied to the turn, if any.
+  skill     String?
+  createdAt DateTime @default(now())
+
+  @@index([userId, createdAt])
+}

@@ -1,0 +1,27 @@
+{
+  "name": "skillos",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Open-source AI terminal hub with intelligent routing, portable skills, and terminal interoperability.",
+  "license": "MIT",
+  "type": "module",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev": "concurrently -n server,client -c blue,magenta \"npm:dev:server\" \"npm:dev:client\"",
+    "dev:server": "npm run dev --workspace apps/server",
+    "dev:client": "npm run dev --workspace apps/client",
+    "cli": "npm run start --workspace apps/cli",
+    "build": "npm run build --workspaces --if-present",
+    "typecheck": "npm run typecheck --workspaces --if-present"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.0",
+    "typescript": "^5.7.2"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

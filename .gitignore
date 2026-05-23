@@ -1,0 +1,36 @@
+# dependencies
+node_modules/
+.pnp.*
+
+# build output
+dist/
+build/
+*.tsbuildinfo
+
+# env & secrets
+.env
+.env.local
+.env.*.local
+
+# database
+*.sqlite
+*.sqlite3
+*.db
+
+# generated Prisma client (regenerate with `npm run db:generate -w apps/server`)
+apps/server/src/generated/
+
+# logs
+*.log
+npm-debug.log*
+
+# editor / OS
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/*
+!.vscode/extensions.json
+
+# misc
+.cache/
+coverage/
