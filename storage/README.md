@@ -7,6 +7,7 @@ file; runtime data-access lives in `apps/server/src/storage/`.
 
 - `schema.prisma` — the data model (see below).
 - `skillos.db` — the SQLite database (gitignored; created by `db:push`).
+- `memory/<userId>.md` — cross-session memory docs (gitignored; see below).
 
 The Prisma **client** is generated into `apps/server/src/generated/prisma/`
 (gitignored) and the CLI config lives in `apps/server/prisma.config.ts`.
@@ -56,3 +57,21 @@ missing.
 
 This dev schema uses `db push` (no migration history yet). To switch to
 migrations later: `npx prisma migrate dev` with the same config.
+
+## Cross-session memory (`memory/`)
+
+SkillOS keeps a small, human-readable **Markdown memory doc per user** at
+`storage/memory/<userId>.md` (override the dir with `SKILLOS_MEMORY_DIR`; the
+dir is created on first write). Runtime logic lives in
+`apps/server/src/memory/memory.ts`.
+
+- **Compress on close:** when a connection with any messages disconnects, the
+  recent conversation (last ~30 messages) is merged with the prior memory into
+  an updated doc, bounded to ~2000 chars. With a real provider the model
+  summarizes it (~200 words); offline (mock) it's a **deterministic** dated
+  digest of recent user turns — the mock LLM text is never used.
+- **Recall on open:** on the next local connection the doc is loaded and a
+  `🧠 Recalled memory…` info line is shown, and the memory is prepended as a
+  bounded preamble to the system prompt so the model has prior context.
+
+The docs hold private conversation data and are **gitignored** (`storage/memory/`).

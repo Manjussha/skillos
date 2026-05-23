@@ -17,6 +17,9 @@ build/
 *.sqlite3
 *.db
 
+# cross-session memory docs (private conversation data)
+storage/memory/
+
 # generated Prisma client (regenerate with `npm run db:generate -w apps/server`)
 apps/server/src/generated/
 

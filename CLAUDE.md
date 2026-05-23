@@ -18,6 +18,8 @@ Source of truth for the long-term vision is [`POD.md`](./POD.md); the realistic,
 
 Each layer has a verifier under `scripts/` (`smoke.mjs`, `verify-layer2|3|4|5.mjs`) — all pass against a live local server with the mock provider (no API keys needed). Layers 4 and 5 degrade gracefully when `cloudflared` / `aider` aren't installed, so everything is verifiable offline.
 
+Two post-v0.1 additions ride on the existing protocol (no new ServerMessage types): a **runtime LLM picker** — `/provider` (local-only; switch provider / connect an API key via `applyProviderChoice`, writing `.env` live) and `/models` (interactive numbered model selection); both use a `session.picker` state handled before command parsing (a `/command` cancels an active picker). And **cross-session memory** — `apps/server/src/memory/memory.ts` compresses a session into `storage/memory/<userId>.md` on disconnect (model summary if a provider is set, else a deterministic offline digest) and recalls it on the next connection, injecting a bounded preamble into the system prompt. Verifier: `scripts/verify-memory.mjs`.
+
 This was built **in runnable layers** — keep each layer working before extending. Honest known gaps: no OS sandbox for shell execution yet (the permission gate is the active control); the Aider live-proxy path is untested without `aider` installed. See each subsystem README for details.
 
 ## Commands

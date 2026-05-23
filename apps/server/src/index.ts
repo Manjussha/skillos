@@ -32,6 +32,11 @@ import {
 import { generateSkills } from "./onboarding/generate.js";
 import { applyProviderChoice } from "./onboarding/env.js";
 import {
+  loadMemory,
+  saveMemory,
+  compressSession,
+} from "./memory/memory.js";
+import {
   listAgents,
   listWorkflows,
   getAgent,
@@ -102,7 +107,24 @@ interface Session {
   authenticated: boolean;
   /** In-flight permission prompts awaiting a client response, by id. */
   pendingPermissions: Map<string, PendingPermission>;
+  /**
+   * Short interactive selection in progress (runtime LLM picker), or null.
+   * Handled before command parsing, mirroring the `onboarding` branch. A
+   * `/command` typed while a picker is active cancels it (falls through).
+   */
+  picker:
+    | null
+    | { kind: "provider" }
+    | { kind: "apiKey"; provider: string }
+    | { kind: "model" };
+  /** Recalled cross-session memory for this user (null if none). */
+  memory: string | null;
+  /** Whether this session has produced any persisted messages (drives compress). */
+  hadMessages: boolean;
 }
+
+/** Per-user guard so concurrent disconnects don't clobber the memory doc. */
+const memoryWrites = new Set<string>();
 
 const dir = skillsDir();
 const skills = await loadSkills(dir);
@@ -178,7 +200,15 @@ async function initConnection(
     isLocal,
     authenticated: isLocal,
     pendingPermissions: new Map(),
+    picker: null,
+    memory: null,
+    hadMessages: false,
   };
+
+  // Cross-session memory: recall the user's prior memory doc, if any. Done
+  // before greeting so the recall info lands right after "Connected".
+  const memory = await loadMemory(user.id);
+  if (memory) session.memory = memory;
 
   if (!isLocal) {
     // A remote connection must authenticate before doing anything. We still
@@ -202,6 +232,20 @@ async function initConnection(
       text: `Connected. ${skills.size} skills loaded. First run — let's set up.`,
     });
     startOnboarding(ws, session);
+  }
+
+  // Surface recalled memory to local sessions. Sent outside a turn (like the
+  // greeting) — clients rearm on idle info, so no endTurn is needed. We don't
+  // leak prior context to unauthenticated remote sessions.
+  if (session.memory && isLocal) {
+    const excerpt = session.memory.slice(0, 300);
+    send(ws, {
+      type: "info",
+      text:
+        "🧠 Recalled memory from previous sessions:\n" +
+        excerpt +
+        (session.memory.length > 300 ? "\n…" : ""),
+    });
   }
 
   ws.on("message", (raw) => {
@@ -230,7 +274,37 @@ async function initConnection(
       p.resolve(false);
     }
     session.pendingPermissions.clear();
+
+    // Cross-session memory: compress this session into the user's memory doc
+    // (best-effort, fire-and-forget). The server process stays alive, so this
+    // async completes after the socket is gone. Guard empty sessions and
+    // concurrent writes for the same user.
+    void persistMemory(session);
   });
+}
+
+/**
+ * Compress the just-closed session into the user's long-term memory doc.
+ * Best-effort: skips empty sessions, serializes per-user writes, never throws.
+ */
+async function persistMemory(session: Session): Promise<void> {
+  if (!session.hadMessages) return;
+  if (memoryWrites.has(session.userId)) return;
+  memoryWrites.add(session.userId);
+  try {
+    const prior = await loadMemory(session.userId);
+    const updated = await compressSession({
+      userId: session.userId,
+      mode: session.mode,
+      priorMemory: prior,
+      take: 30,
+    });
+    if (updated.trim()) await saveMemory(session.userId, updated);
+  } catch {
+    // Memory is a nicety, not a guarantee — never let it break shutdown.
+  } finally {
+    memoryWrites.delete(session.userId);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -350,6 +424,19 @@ async function handleInput(
     return endTurn(ws);
   }
 
+  // Runtime LLM picker (Feature A): a short interactive selection in progress.
+  // Handled before command parsing, mirroring onboarding. A `/command` typed
+  // here CANCELS the picker and falls through to normal command handling.
+  if (session.picker) {
+    if (text.trim().startsWith("/")) {
+      session.picker = null;
+      send(ws, { type: "info", text: "(picker cancelled)" });
+      // fall through to command handling below
+    } else {
+      return advancePicker(ws, session, text);
+    }
+  }
+
   const cmd = parse(text);
 
   if (cmd.kind === "command") {
@@ -385,7 +472,12 @@ async function handleInput(
         sendSkills(ws, session);
         break;
       case "models":
-        sendModels(ws, session);
+        // Feature A: now an interactive picker (selection happens next input).
+        startModelPicker(ws, session);
+        break;
+      case "provider":
+        // Feature A: runtime provider/key switch (local only — writes .env).
+        startProviderPicker(ws, session);
         break;
       case "use":
         setModel(ws, session, cmd.args);
@@ -571,6 +663,157 @@ async function doGenerateSkills(ws: WebSocket, description: string): Promise<voi
 }
 
 // ---------------------------------------------------------------------------
+// Runtime LLM picker (Feature A) — /provider and /models, OpenCode-style
+// ---------------------------------------------------------------------------
+
+/** Derive the currently-active backend from the live environment. */
+function activeBackend(): string {
+  if (process.env.OPENROUTER_API_KEY) return "openrouter";
+  if (process.env.OLLAMA_BASE_URL) return "ollama";
+  return "mock (offline)";
+}
+
+/**
+ * `/provider` — switch provider / connect an API key at runtime. Local-only,
+ * like onboarding, because it writes `.env`. Shows a numbered list, sets the
+ * picker, and ends the turn; the selection is handled on the next input.
+ */
+function startProviderPicker(ws: WebSocket, session: Session): void {
+  if (!session.isLocal) {
+    send(ws, {
+      type: "info",
+      text: "Provider/key setup is available on the local terminal only.",
+    });
+    return;
+  }
+  session.picker = { kind: "provider" };
+  send(ws, {
+    type: "info",
+    text: [
+      `Active backend: ${activeBackend()}.`,
+      "Choose a provider (or type a /command to cancel):",
+      "  1) OpenRouter (paste key — unlocks Claude/GPT/Gemini/DeepSeek/Groq)",
+      "  2) Ollama (local, no key)",
+      "  3) Skip (offline mock)",
+    ].join("\n"),
+  });
+}
+
+/**
+ * `/models` — pick the active logical model at runtime. Lists KNOWN_MODELS with
+ * the current override marked, sets the picker, and ends the turn.
+ */
+function startModelPicker(ws: WebSocket, session: Session): void {
+  session.picker = { kind: "model" };
+  const current = session.override ?? "auto";
+  const lines = KNOWN_MODELS.map((m, i) => {
+    const mark = m === session.override ? " *" : "";
+    return `  ${i + 1}) ${m}${mark}`;
+  });
+  send(ws, {
+    type: "info",
+    text: [
+      `Current model: ${current} (* = active override).`,
+      "Pick a model by number (or 0 / 'auto' to clear; /command to cancel):",
+      ...lines,
+    ].join("\n"),
+  });
+}
+
+/**
+ * Advance whatever picker is active with the user's input. Always clears or
+ * re-arms the picker and ends the turn (info-only — never streams), preserving
+ * the turn-end contract.
+ */
+async function advancePicker(
+  ws: WebSocket,
+  session: Session,
+  answer: string,
+): Promise<void> {
+  const picker = session.picker;
+  if (!picker) return endTurn(ws);
+  const text = answer.trim();
+
+  if (picker.kind === "provider") {
+    const choice = text.toLowerCase();
+    if (choice === "1" || choice === "openrouter") {
+      // Advance to the API-key step rather than finishing.
+      session.picker = { kind: "apiKey", provider: "openrouter" };
+      send(ws, {
+        type: "info",
+        text:
+          "Paste your OpenRouter API key (stored in .env, gitignored), or type " +
+          "'skip' to cancel. Heads-up: what you type is visible in the terminal.",
+      });
+      return endTurn(ws);
+    }
+    if (choice === "2" || choice === "ollama") {
+      const env = await applyProviderChoice("ollama", "");
+      session.picker = null;
+      send(ws, { type: "info", text: `${env.message}\nActive backend: ${activeBackend()}.` });
+      return endTurn(ws);
+    }
+    if (choice === "3" || choice === "skip") {
+      const env = await applyProviderChoice("skip", "");
+      session.picker = null;
+      send(ws, { type: "info", text: `${env.message}\nActive backend: ${activeBackend()}.` });
+      return endTurn(ws);
+    }
+    // Unrecognized — cancel cleanly so the user isn't stuck.
+    session.picker = null;
+    send(ws, {
+      type: "info",
+      text: `"${text}" isn't a provider option — picker cancelled.`,
+    });
+    return endTurn(ws);
+  }
+
+  if (picker.kind === "apiKey") {
+    if (text.toLowerCase() === "skip" || text === "") {
+      session.picker = null;
+      send(ws, { type: "info", text: "Cancelled — no key saved." });
+      return endTurn(ws);
+    }
+    const env = await applyProviderChoice(picker.provider, text);
+    session.picker = null;
+    send(ws, { type: "info", text: `${env.message}\nActive backend: ${activeBackend()}.` });
+    return endTurn(ws);
+  }
+
+  // Model picker.
+  const choice = text.toLowerCase();
+  if (choice === "0" || choice === "auto") {
+    session.override = null;
+    session.picker = null;
+    send(ws, { type: "info", text: "Model override cleared (auto routing)." });
+    return endTurn(ws);
+  }
+  const n = Number(choice);
+  if (Number.isInteger(n) && n >= 1 && n <= KNOWN_MODELS.length) {
+    const model = KNOWN_MODELS[n - 1]!;
+    session.override = model;
+    session.picker = null;
+    send(ws, { type: "info", text: `Model override set to "${model}".` });
+    return endTurn(ws);
+  }
+  // Allow selecting by exact name too.
+  const byName = (KNOWN_MODELS as readonly string[]).find((m) => m === choice);
+  if (byName) {
+    session.override = byName;
+    session.picker = null;
+    send(ws, { type: "info", text: `Model override set to "${byName}".` });
+    return endTurn(ws);
+  }
+  // Non-matching entry cancels with a note.
+  session.picker = null;
+  send(ws, {
+    type: "info",
+    text: `"${text}" isn't in the list — picker cancelled. Override unchanged (${session.override ?? "auto"}).`,
+  });
+  return endTurn(ws);
+}
+
+// ---------------------------------------------------------------------------
 // Remote access (Layer 4) — tunnel, tokens, QR
 // ---------------------------------------------------------------------------
 
@@ -738,6 +981,7 @@ async function runSingle(
   // Layer 4: agents may declare privileged tools — gate them for remote sessions.
   if (!(await ensurePermission(ws, session, `agent ${name}`, getAgentTools(name))))
     return;
+  session.hadMessages = true;
   // Persist the user turn (best-effort).
   void saveMessage({
     userId: session.userId,
@@ -778,6 +1022,7 @@ async function runWorkflowCommand(
     type: "info",
     text: `Workflow /${wf.name}: ${wf.steps.join(" → ")}\nTask: ${task}`,
   });
+  session.hadMessages = true;
   // Persist the user turn (best-effort).
   void saveMessage({
     userId: session.userId,
@@ -938,6 +1183,7 @@ async function runBridge(
     text: `→ bridge: ${wrapper.bridge.name} · command: ${name} · status: ${wrapper.bridge.status}`,
   });
 
+  session.hadMessages = true;
   // Persist the user turn (best-effort), like the core loop.
   void saveMessage({
     userId: session.userId,
@@ -991,6 +1237,20 @@ async function runBridge(
 // Core loop (Layer 1) + message persistence
 // ---------------------------------------------------------------------------
 
+/** Max chars of recalled memory injected into a system prompt (keep it small). */
+const MEMORY_PREAMBLE_MAX = 1200;
+
+/**
+ * Prepend a bounded "memory" preamble to a system prompt when the session has
+ * recalled memory, so the model has prior-session context. Bounded so it never
+ * dwarfs the real prompt.
+ */
+function withMemory(session: Session, system: string): string {
+  if (!session.memory) return system;
+  const mem = session.memory.slice(0, MEMORY_PREAMBLE_MAX);
+  return `Context from previous sessions (memory):\n${mem}\n---\n${system}`;
+}
+
 async function runSkill(
   ws: WebSocket,
   session: Session,
@@ -1022,7 +1282,11 @@ async function run(
 ): Promise<void> {
   const model = routeModel(skill, session.override);
   const res = resolveProvider(model, session.mode);
-  const system = skill?.prompt || DEFAULT_SYSTEM;
+  // Prepend a bounded memory preamble so the model "remembers" prior sessions,
+  // without letting it dwarf the actual system prompt.
+  const baseSystem = skill?.prompt || DEFAULT_SYSTEM;
+  const system = withMemory(session, baseSystem);
+  session.hadMessages = true;
 
   send(ws, {
     type: "info",
@@ -1075,8 +1339,9 @@ function sendHelp(ws: WebSocket): void {
       "Commands:",
       "  /help                  show this help",
       "  /skills                list available skills (active ones marked *)",
-      "  /models                list known models + current override",
+      "  /models                pick the active model interactively (or /use <model>)",
       "  /use <model>           force a model (e.g. /use claude); /use auto to clear",
+      "  /provider              switch provider / connect an API key (local only)",
       "  /onboarding            (re)run first-run personalization",
       "  /profile               show your saved profile",
       "  /generate-skills <d>   generate custom skills for a described domain",
@@ -1114,13 +1379,6 @@ function sendSkills(ws: WebSocket, session: Session): void {
     ? "\n(* = active for your profile)"
     : "";
   send(ws, { type: "info", text: "Skills:\n" + lines.join("\n") + note });
-}
-
-function sendModels(ws: WebSocket, session: Session): void {
-  send(ws, {
-    type: "info",
-    text: `Known models: ${KNOWN_MODELS.join(", ")}\nCurrent override: ${session.override ?? "auto"}`,
-  });
 }
 
 function setModel(ws: WebSocket, session: Session, arg: string): void {
